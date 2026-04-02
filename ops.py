@@ -550,9 +550,20 @@ class Ops:
 
         return True
 
-    def configure_all(self):
-        """Orchestrate post-install configuration for the full stack."""
+    def configure_all(self, progress_cb=None):
+        """Orchestrate post-install configuration for the full stack.
+        progress_cb: optional callback(step: int, total: int, label: str) for UI progress."""
+        TOTAL = 8
+
+        def p(step, label):
+            if progress_cb:
+                try:
+                    progress_cb(step, TOTAL, label)
+                except Exception:
+                    pass
+
         self.log("=== Auto-Configure ===", "bold")
+        p(1, "Preparing folders…")
 
         for key in ("media_root", "downloads_root"):
             Path(self.cfg[key]).mkdir(parents=True, exist_ok=True)
@@ -561,10 +572,12 @@ class Ops:
 
         self.log("")
         self.log("--- qBittorrent ---", "bold")
+        p(2, "Configuring qBittorrent…")
         self.configure_qbittorrent()
 
         arr_info = {}
         arr_apps = {a["name"]: a for a in APPS if a.get("arr_version")}
+        p(3, "Waiting for *arr config files…")
         for name, app in arr_apps.items():
             self.log("")
             self.log(f"--- {name} (reading config) ---", "bold")
@@ -579,6 +592,7 @@ class Ops:
         radarr   = arr_info.get("Radarr",   {})
         prowlarr = arr_info.get("Prowlarr", {})
 
+        p(4, "Sonarr…")
         if sonarr:
             self.log("")
             self.log("--- Sonarr ---", "bold")
@@ -587,6 +601,7 @@ class Ops:
                 sonarr["app"], tv_path, "sonarr",
                 self.cfg["sonarr_port"], sonarr["key"], sonarr["port"])
 
+        p(5, "Radarr…")
         if radarr:
             self.log("")
             self.log("--- Radarr ---", "bold")
@@ -595,6 +610,7 @@ class Ops:
                 radarr["app"], movies_path, "radarr",
                 self.cfg["radarr_port"], radarr["key"], radarr["port"])
 
+        p(6, "Prowlarr…")
         if prowlarr and sonarr and radarr:
             self.log("")
             self.log("--- Prowlarr ---", "bold")
@@ -603,6 +619,7 @@ class Ops:
                 radarr["key"],   radarr["port"],
                 prowlarr["key"], prowlarr["port"])
 
+        p(7, "Bazarr…")
         if sonarr or radarr:
             self.log("")
             self.log("--- Bazarr ---", "bold")
@@ -612,6 +629,7 @@ class Ops:
 
         self.log("")
         self.log("--- Jellyfin ---", "bold")
+        p(8, "Jellyfin libraries…")
         self.configure_jellyfin()
 
         self.log("")

@@ -1,0 +1,2 @@
+# Optional: enables per-app RAM display on the Dashboard
+psutil>=5.9.0

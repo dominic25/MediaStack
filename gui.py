@@ -1,19 +1,72 @@
 """
 Tkinter GUI for Media Stack Manager.
 """
+import json
+import os
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 import queue, threading, ctypes
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 from constants import (
-    VERSION, APPS, THEMES,
+    VERSION, APPS, THEMES, HELP_FAQ, CONFIG_PORT_KEYS, DEFAULTS,
     C_ACCENT, C_LOG_BG, C_LOG_FG, C_LOG_OK, C_LOG_WRN, C_LOG_ERR,
     F_MAIN, F_BOLD, F_TITLE, F_MONO,
 )
 from config import Config
 from ops import Ops
+from deps import check_environment, app_memory_mb
+
+
+class _Tooltip:
+    """Simple hover tooltip; colors follow the app theme when `app` is set."""
+    def __init__(self, widget, text, app=None):
+        self.widget = widget
+        self.text = text
+        self.app = app
+        self._tip = None
+        widget.bind("<Enter>", self._enter)
+        widget.bind("<Leave>", self._leave)
+
+    def _theme_colors(self):
+        if self.app:
+            t = self.app._t()
+            return (
+                t.get("tooltip_bg", "#fffde7"),
+                t.get("tooltip_fg", "#111111"),
+                t.get("tooltip_border", "#c5c5c5"),
+            )
+        return "#fffde7", "#111111", "#c5c5c5"
+
+    def _enter(self, _=None):
+        if self._tip or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        except Exception:
+            return
+        bg, fg, bd = self._theme_colors()
+        self._tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.configure(bg=bd)
+        lbl = tk.Label(
+            tw, text=self.text, justify="left",
+            background=bg, foreground=fg,
+            highlightbackground=bd, highlightthickness=1,
+            font=("Segoe UI", 9), wraplength=360, padx=8, pady=4)
+        lbl.pack()
+
+    def _leave(self, _=None):
+        if self._tip:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
 
 
 class App:
@@ -26,18 +79,26 @@ class App:
         self._backup_sets   = []
         self._busy = False
         self._action_buttons = []
+        self._backup_narrow = False
+        self._last_root_w = 0
+        self._onboarding_win = None
+        self._onboarding_txt = None
+        self._json_editor_win = None
+        self._json_editor_txt = None
 
         self._theme_name = self.cfg.get("theme", "light")
 
         self.root = tk.Tk()
         self.root.title(f"Media Stack Manager v{VERSION}")
         self.root.geometry("1050x740")
-        self.root.minsize(800, 600)
+        self.root.minsize(640, 520)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Configure>", self._on_root_configure)
 
         self._setup_styles()
         self._build_header()
         self._build_notebook()
+        self._build_task_progress()
         self._build_log()
         self._build_statusbar()
         self._apply_theme()
@@ -48,6 +109,12 @@ class App:
             self.log("Using default settings.", "warn")
         if not ctypes.windll.shell32.IsUserAnAdmin():
             self.log("WARNING: Not running as Administrator. Some operations may fail.", "warn")
+
+        self.root.after(400, self._refresh_status)
+        self.root.after(250, self._update_dashboard_env_ui)
+        self._schedule_next_poll()
+        if not self.cfg.get("onboarding_complete"):
+            self.root.after(700, self._show_onboarding)
 
     # --- theme ---
 
@@ -87,6 +154,23 @@ class App:
         self.backup_list.configure(bg=t["listbox_bg"], fg=t["listbox_fg"],
                                    selectbackground=C_ACCENT, selectforeground="white")
         self._toggle_btn.configure(text=t["toggle_lbl"])
+        if self._onboarding_win and self._onboarding_txt:
+            try:
+                self._onboarding_win.configure(bg=t["bg"])
+                self._onboarding_txt.configure(
+                    bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"],
+                    selectbackground=t["card"], selectforeground=t["fg"])
+            except Exception:
+                self._onboarding_win = None
+                self._onboarding_txt = None
+        if self._json_editor_win and self._json_editor_txt:
+            try:
+                self._json_editor_win.configure(bg=t["bg"])
+                self._json_editor_txt.configure(
+                    bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"])
+            except Exception:
+                self._json_editor_win = None
+                self._json_editor_txt = None
 
     def _toggle_theme(self):
         self._theme_name = "dark" if self._theme_name == "light" else "light"
@@ -97,6 +181,13 @@ class App:
     def _tw_add(self, widget, **props):
         """Register a tk widget for theme updates. props maps configure-key -> theme-key."""
         self._tw.append(lambda t, w=widget, p=props: w.configure(**{k: t[v] for k, v in p.items()}))
+
+    def _tw_label_frame(self, lf):
+        """LabelFrame: theme bg/fg and hide default light border in dark mode."""
+        self._tw_add(lf, bg="lf_bg", fg="lf_fg")
+        self._tw.append(
+            lambda t, w=lf: w.configure(
+                highlightbackground=t["lf_bg"], highlightcolor=t["lf_bg"]))
 
     # --- mouse-wheel scrolling ---
 
@@ -129,9 +220,370 @@ class App:
     def _build_notebook(self):
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+        self._build_dashboard_tab()
         self._build_install_tab()
         self._build_backup_tab()
         self._build_settings_tab()
+        self._build_help_tab()
+
+    def _on_root_configure(self, event):
+        if event.widget != self.root:
+            return
+        w = event.width
+        if abs(w - self._last_root_w) < 8:
+            return
+        self._last_root_w = w
+        narrow = w < 920
+        if narrow != self._backup_narrow:
+            self._backup_narrow = narrow
+            self._layout_backup_columns()
+
+    def _layout_backup_columns(self):
+        if not getattr(self, "_backup_lf", None):
+            return
+        outer = self._backup_outer
+        if self._backup_narrow:
+            outer.columnconfigure(0, weight=1)
+            outer.columnconfigure(1, weight=0)
+            self._backup_lf.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+            self._backup_rf.grid(row=1, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        else:
+            outer.columnconfigure(0, weight=1)
+            outer.columnconfigure(1, weight=1)
+            self._backup_lf.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
+            self._backup_rf.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
+
+    # --- Task progress (install / uninstall / auto-configure) ---
+
+    def _build_task_progress(self):
+        self._task_pf = ttk.Frame(self.root)
+        self._task_pf.pack(fill="x", padx=10, pady=(0, 4))
+        self._progress_msg = tk.StringVar(value="")
+        ttk.Label(self._task_pf, textvariable=self._progress_msg, font=F_MAIN).pack(
+            side="left", anchor="w", padx=(0, 8))
+        self._progress_bar = ttk.Progressbar(
+            self._task_pf, mode="determinate", length=280, maximum=100, value=0)
+        self._progress_bar.pack(side="left", fill="x", expand=True)
+
+    def _get_poll_interval_ms(self):
+        try:
+            s = int(self.cfg.get("poll_interval_seconds") or 45)
+            return max(15, min(3600, s)) * 1000
+        except Exception:
+            return 45000
+
+    def _in_quiet_hours(self):
+        if not self.cfg.get("quiet_hours_enabled"):
+            return False
+        try:
+            a = str(self.cfg.get("quiet_hours_start", "22:00")).strip().split(":")
+            b = str(self.cfg.get("quiet_hours_end", "07:00")).strip().split(":")
+            sh, sm = int(a[0]), int(a[1])
+            eh, em = int(b[0]), int(b[1])
+            t_start = dt_time(sh, sm)
+            t_end = dt_time(eh, em)
+        except Exception:
+            return False
+        now = datetime.now().time()
+        if t_start <= t_end:
+            return t_start <= now <= t_end
+        return now >= t_start or now <= t_end
+
+    def _schedule_next_poll(self):
+        self.root.after(self._get_poll_interval_ms(), self._schedule_status_poll)
+
+    def _enqueue_task_progress(self, cur, total, msg):
+        self.q.put(lambda: self._apply_task_progress(cur, total, msg))
+
+    def _apply_task_progress(self, cur, total, msg):
+        self._progress_msg.set(msg)
+        try:
+            self._progress_bar.stop()
+        except Exception:
+            pass
+        self._progress_bar.configure(mode="determinate", maximum=max(1, total), value=cur)
+
+    def _clear_task_progress_ui(self):
+        self._progress_msg.set("")
+        try:
+            self._progress_bar.stop()
+        except Exception:
+            pass
+        self._progress_bar.configure(mode="determinate", maximum=100, value=0)
+
+    def _enqueue_clear_task_progress(self):
+        self.q.put(self._clear_task_progress_ui)
+
+    # --- Dashboard ---
+
+    def _build_dashboard_tab(self):
+        outer = ttk.Frame(self.nb)
+        self.nb.add(outer, text="  Dashboard  ")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(3, weight=1)
+
+        env_fr = tk.LabelFrame(
+            outer, text=" System & dependencies ", font=F_BOLD, padx=10, pady=8,
+            highlightthickness=0)
+        self._tw_label_frame(env_fr)
+        env_fr.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        self._dash_env_inner = tk.Frame(env_fr)
+        self._tw_add(self._dash_env_inner, bg="lf_bg")
+        self._dash_env_inner.pack(fill="x")
+        self._dash_env_labels = {}
+        for key, title in [
+            ("winget", "winget (installs)"),
+            ("docker_cli", "Docker CLI"),
+            ("docker_daemon", "Docker running"),
+            ("admin", "Administrator"),
+            ("disk_free_gb", "Free disk (C:)"),
+        ]:
+            row = tk.Frame(self._dash_env_inner)
+            self._tw_add(row, bg="lf_bg")
+            row.pack(fill="x", pady=1)
+            lbl_t = tk.Label(row, text=title + ":", font=F_MAIN, width=22, anchor="w")
+            self._tw_add(lbl_t, bg="lf_bg", fg="fg_dim")
+            lbl_t.pack(side="left")
+            sv = tk.StringVar(value="—")
+            self._dash_env_labels[key] = sv
+            lb = tk.Label(row, textvariable=sv, font=F_MONO, anchor="w")
+            self._tw_add(lb, bg="lf_bg", fg="fg")
+            lb.pack(side="left", fill="x", expand=True)
+
+        ck_fr = tk.LabelFrame(
+            outer, text=" First-time checklist ", font=F_BOLD, padx=10, pady=8,
+            highlightthickness=0)
+        self._tw_label_frame(ck_fr)
+        ck_fr.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self._checklist_vars = {}
+        ck_items = [
+            ("checklist_folders_saved", "Saved valid folder paths in Settings"),
+            ("checklist_deps_reviewed", "Reviewed system dependencies (above)"),
+            ("checklist_apps_installed", "Installed apps from the Install tab"),
+            ("checklist_auto_configure_done", "Ran Auto-Configure successfully"),
+            ("checklist_jellyfin_api", "Set Jellyfin API key (for library setup)"),
+        ]
+        ck_inner = tk.Frame(ck_fr)
+        self._tw_add(ck_inner, bg="lf_bg")
+        ck_inner.pack(fill="x")
+        for key, ctext in ck_items:
+            var = tk.BooleanVar(value=bool(self.cfg.get(key)))
+            self._checklist_vars[key] = var
+
+            def _mk_toggle(k, v=var):
+                def _t():
+                    self.cfg[k] = v.get()
+                    self.cfg.save()
+                return _t
+
+            cb = ttk.Checkbutton(
+                ck_inner, text=ctext, variable=var, command=_mk_toggle(key))
+            cb.pack(anchor="w", pady=1)
+        _Tooltip(
+            ck_fr,
+            "Check items as you complete them. Stored in your config file.",
+            self)
+
+        self._dash_alert_var = tk.StringVar(value="")
+        alert = tk.Label(outer, textvariable=self._dash_alert_var, font=F_MAIN, anchor="w",
+                         wraplength=900, justify="left")
+        self._tw_add(alert, bg="bg", fg="fg")
+        alert.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 8))
+
+        apps_fr = tk.LabelFrame(
+            outer, text=" Applications ", font=F_BOLD, padx=8, pady=8,
+            highlightthickness=0)
+        self._tw_label_frame(apps_fr)
+        apps_fr.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        apps_fr.columnconfigure(0, weight=1)
+        apps_fr.columnconfigure(1, weight=1)
+
+        self._dashboard_status_vars = {}
+        self._dashboard_status_labels = {}
+        self._dashboard_mem_vars = {}
+        for i, app in enumerate(APPS):
+            r, c = divmod(i, 2)
+            card = tk.Frame(apps_fr, padx=8, pady=6, cursor="hand2")
+            self._tw_add(card, bg="card")
+            card.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
+            name = app["name"]
+            port_k = app.get("port_key")
+            port_txt = f"Port {self.cfg[port_k]}" if port_k else "—"
+            nl = tk.Label(card, text=name, font=F_BOLD, anchor="w")
+            self._tw_add(nl, bg="card", fg="fg")
+            nl.pack(anchor="w")
+            pl = tk.Label(card, text=port_txt, font=F_MONO, anchor="w")
+            self._tw_add(pl, bg="card", fg="fg_dim")
+            pl.pack(anchor="w")
+            sv = tk.StringVar(value="…")
+            self._dashboard_status_vars[name] = sv
+            sl = tk.Label(card, textvariable=sv, font=F_MAIN, anchor="w")
+            self._tw_add(sl, bg="card", fg="fg")
+            sl.pack(anchor="w")
+            self._dashboard_status_labels[name] = sl
+            mv = tk.StringVar(value="")
+            self._dashboard_mem_vars[name] = mv
+            ml = tk.Label(card, textvariable=mv, font=F_MONO, anchor="w")
+            self._tw_add(ml, bg="card", fg="fg_dim")
+            ml.pack(anchor="w")
+            tip = "Double-click to open web UI when the app is running."
+            for w in (card, nl, pl, sl, ml):
+                w.bind("<Double-1>", lambda e, a=app: self._open_app_web_ui(a))
+            _Tooltip(card, tip, self)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=4, column=0, sticky="w", padx=12, pady=(0, 10))
+        b1 = ttk.Button(btn_row, text="Refresh status", style="Small.TButton",
+                        command=self._refresh_status)
+        b1.pack(side="left", padx=(0, 6))
+        b2 = ttk.Button(btn_row, text="Re-check dependencies", style="Small.TButton",
+                        command=self._update_dashboard_env_ui)
+        b2.pack(side="left")
+        self._action_buttons.extend([b1, b2])
+        _Tooltip(b1, "Poll all app statuses and memory (if psutil is installed).", self)
+        _Tooltip(b2, "Re-run winget / Docker / admin / disk checks.", self)
+
+    def _update_dashboard_env_ui(self):
+        env = check_environment()
+        self._dash_env_labels["winget"].set(
+            "OK" if env["winget"] else "Missing — install App Installer / winget")
+        self._dash_env_labels["docker_cli"].set("OK" if env["docker_cli"] else "Not found")
+        self._dash_env_labels["docker_daemon"].set(
+            "OK" if env["docker_daemon"] else "Not running or unreachable")
+        self._dash_env_labels["admin"].set("Yes" if env["admin"] else "No — some tasks may fail")
+        df = env.get("disk_free_gb")
+        self._dash_env_labels["disk_free_gb"].set(f"{df} GB" if df is not None else "—")
+
+    def _update_dashboard_alert(self):
+        issues = []
+        for app in APPS:
+            name = app["name"]
+            if name not in self.status_vars:
+                continue
+            s = self.status_vars[name].get()
+            if s == "Stopped":
+                issues.append(f"{name} is stopped")
+        env = check_environment()
+        if not env["winget"]:
+            issues.insert(0, "winget missing — automated installs may fail")
+        if not env["docker_cli"] and any(a.get("container") for a in APPS):
+            issues.append("Docker CLI missing — needed for Byparr/Seer")
+        elif env["docker_cli"] and not env["docker_daemon"]:
+            issues.append("Docker is not running")
+        if issues:
+            seen = []
+            for x in issues:
+                if x not in seen:
+                    seen.append(x)
+            short = seen[:8]
+            self._dash_alert_var.set(
+                "Attention: " + "; ".join(short) + (" …" if len(seen) > 8 else ""))
+        else:
+            self._dash_alert_var.set(
+                "No blocking issues detected. Review per-app status above.")
+
+    def _set_dashboard_mem(self, name, mb):
+        if name not in self._dashboard_mem_vars:
+            return
+        app = next((a for a in APPS if a["name"] == name), None)
+        if app and app.get("container"):
+            self._dashboard_mem_vars[name].set("RAM: — (see Docker)")
+            return
+        if mb is None:
+            self._dashboard_mem_vars[name].set("RAM: — (install psutil for usage)")
+        else:
+            self._dashboard_mem_vars[name].set(f"RAM: ~{mb} MB")
+
+    def _build_help_tab(self):
+        outer = ttk.Frame(self.nb)
+        self.nb.add(outer, text="  Help  ")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        txt = scrolledtext.ScrolledText(
+            outer, wrap="word", font=F_MAIN, height=24, state="disabled",
+            padx=12, pady=12)
+        txt.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        self._help_txt = txt
+        self._tw_add(txt, bg="entry_bg", fg="fg")
+        self._tw.append(lambda t, w=txt: w.configure(insertbackground=t["fg"]))
+        self._tw.append(lambda t, w=txt: w.tag_configure("bold", font=F_BOLD, foreground=t["section_fg"]))
+        txt.configure(state="normal")
+        txt.insert("1.0", HELP_FAQ.strip() + "\n\n")
+        txt.insert("end", f"Media Stack Manager v{VERSION}\n", "bold")
+        txt.configure(state="disabled")
+
+        hf = ttk.Frame(outer)
+        hf.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 12))
+        ttk.Button(hf, text="Open config folder", style="Small.TButton",
+                   command=self._open_config_folder).pack(side="left", padx=(0, 8))
+        ttk.Button(hf, text="Show onboarding again", style="Small.TButton",
+                   command=self._show_onboarding).pack(side="left")
+
+    def _open_config_folder(self):
+        from constants import CONF_FILE
+        p = CONF_FILE.parent
+        try:
+            os.startfile(str(p))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _show_onboarding(self):
+        win = tk.Toplevel(self.root)
+        win.title("Getting started")
+        win.transient(self.root)
+        win.grab_set()
+        win.minsize(420, 380)
+        th = self._t()
+        win.configure(bg=th["bg"])
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        body = (
+            "Welcome to Media Stack Manager.\n\n"
+            "1. Open Settings and set Base, Media, Downloads, and Backup folders.\n"
+            "   Paths must already exist on disk before you can save.\n\n"
+            "2. Use the Dashboard tab to verify winget, Docker, and free disk space.\n\n"
+            "3. Install apps from the Install tab, start them, then run Auto-Configure.\n\n"
+            "4. Add a Jellyfin API key in Settings if you want libraries created automatically.\n\n"
+            "See the Help tab for FAQ and documentation links."
+        )
+        t = tk.Text(
+            frm, wrap="word", font=F_MAIN, height=16, width=54, state="disabled",
+            bg=th["entry_bg"], fg=th["fg"], insertbackground=th["fg"],
+            selectbackground=th["card"], selectforeground=th["fg"],
+            relief="flat", borderwidth=0, highlightthickness=0)
+        t.pack(fill="both", expand=True, pady=(0, 12))
+        t.configure(state="normal")
+        t.insert("1.0", body)
+        t.configure(state="disabled")
+
+        self._onboarding_win = win
+        self._onboarding_txt = t
+
+        def _onboarding_closed(event):
+            if event.widget is win:
+                self._onboarding_win = None
+                self._onboarding_txt = None
+
+        win.bind("<Destroy>", _onboarding_closed)
+        dont = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm, text="Do not show this wizard again", variable=dont
+        ).pack(anchor="w")
+        bf = ttk.Frame(frm)
+        bf.pack(fill="x", pady=(8, 0))
+
+        def finish():
+            if dont.get():
+                self.cfg["onboarding_complete"] = True
+                self.cfg.save()
+            win.destroy()
+
+        ttk.Button(bf, text="Get started", style="Accent.TButton", command=finish).pack(side="right")
+
+        def _close_onboarding():
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _close_onboarding)
 
     # --- Install tab ---
 
@@ -146,25 +598,32 @@ class App:
         ttk.Entry(top, textvariable=self.base_var, width=34).pack(side="left", padx=6)
         ttk.Button(top, text="Browse", style="Small.TButton",
                    command=self._browse_base).pack(side="left")
-        ttk.Button(top, text="Refresh Status", style="Small.TButton",
-                   command=self._refresh_status).pack(side="left", padx=(8, 0))
-        btn = ttk.Button(top, text="Install All", style="Accent.TButton",
+        btn_ref = ttk.Button(top, text="Refresh Status", style="Small.TButton",
+                   command=self._refresh_status)
+        btn_ref.pack(side="left", padx=(8, 0))
+        _Tooltip(btn_ref, "Re-query Windows services, Docker, and executables.", self)
+        btn_inst = ttk.Button(top, text="Install All", style="Accent.TButton",
                    command=self._install_all)
-        btn.pack(side="right")
-        self._action_buttons.append(btn)
-        btn = ttk.Button(top, text="Uninstall All", style="Accent.TButton",
+        btn_inst.pack(side="right")
+        self._action_buttons.append(btn_inst)
+        btn_un = ttk.Button(top, text="Uninstall All", style="Accent.TButton",
                    command=self._uninstall_all)
-        btn.pack(side="right", padx=(0, 6))
-        self._action_buttons.append(btn)
-        btn = ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
+        btn_un.pack(side="right", padx=(0, 6))
+        self._action_buttons.append(btn_un)
+        btn_auto = ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
                    command=self._auto_configure)
-        btn.pack(side="right", padx=(0, 6))
-        self._action_buttons.append(btn)
+        btn_auto.pack(side="right", padx=(0, 6))
+        self._action_buttons.append(btn_auto)
+        _Tooltip(btn_inst, "Install all apps in sequence (winget or Docker).", self)
+        _Tooltip(btn_un, "Uninstall all apps (with confirmation).", self)
+        _Tooltip(btn_auto, "Apply paths and app links (requires running services).", self)
 
         cf = ttk.Frame(outer)
         cf.pack(fill="both", expand=True, padx=12, pady=4)
         canvas = tk.Canvas(cf, highlightthickness=0)
         self._tw_add(canvas, bg="bg")
+        self._tw.append(lambda t, w=canvas: w.configure(
+            highlightbackground=t["bg"], highlightcolor=t["bg"]))
         vsb = ttk.Scrollbar(cf, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -207,7 +666,7 @@ class App:
         sv = tk.StringVar(value="")
         self.status_vars[name] = sv
         status_lbl = tk.Label(row, textvariable=sv, font=F_MAIN, anchor="w")
-        self._tw_add(status_lbl, bg="card")
+        self._tw_add(status_lbl, bg="card", fg="fg")
         status_lbl.grid(row=1, column=2, sticky="w", padx=4, pady=(0, 6))
         self._status_labels[name] = status_lbl
         ttk.Button(row, text="Install", style="Small.TButton",
@@ -224,7 +683,21 @@ class App:
                 name = app["name"]
                 self.q.put(lambda n=name, lb=label, ck=color_key:
                            self._set_status(n, lb, ck))
+            for app in APPS:
+                mem = app_memory_mb(app)
+                n = app["name"]
+                self.q.put(lambda n=n, m=mem: self._set_dashboard_mem(n, m))
+            self.q.put(self._update_dashboard_alert)
         self._run_bg(run)
+
+    def _schedule_status_poll(self):
+        if (
+            self.cfg.get("auto_refresh_enabled", True)
+            and not self._in_quiet_hours()
+            and not self._busy
+        ):
+            self._refresh_status()
+        self._schedule_next_poll()
 
     def _set_status(self, name, label, color_key):
         t = self._t()
@@ -233,6 +706,11 @@ class App:
         if name in self._status_labels:
             color = t.get(color_key, t["fg_dim"])
             self._status_labels[name].configure(fg=color)
+        if getattr(self, "_dashboard_status_vars", None) and name in self._dashboard_status_vars:
+            self._dashboard_status_vars[name].set(label)
+            if name in self._dashboard_status_labels:
+                color = t.get(color_key, t["fg_dim"])
+                self._dashboard_status_labels[name].configure(fg=color)
 
     def _browse_base(self):
         d = filedialog.askdirectory(initialdir=self.base_var.get())
@@ -240,6 +718,32 @@ class App:
             self.base_var.set(d)
             self.cfg["base_root"] = d
             self.cfg.save()
+
+    def _app_local_url(self, app):
+        pk = app.get("port_key")
+        if not pk:
+            return None
+        try:
+            port = int(str(self.cfg[pk]).strip())
+        except Exception:
+            return None
+        return f"http://127.0.0.1:{port}/"
+
+    def _open_app_web_ui(self, app):
+        name = app["name"]
+        if name not in self.status_vars:
+            return
+        st = self.status_vars[name].get()
+        if st == "Not installed":
+            messagebox.showinfo("Open in browser", f"{name} is not installed yet.")
+            return
+        url = self._app_local_url(app)
+        if not url:
+            return
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self.log(f"Could not open browser: {e}", "err")
 
     def _install_one(self, app):
         self._run_bg(lambda: self.ops.install_app(app))
@@ -257,7 +761,18 @@ class App:
     def _install_all(self):
         self.cfg["base_root"] = self.base_var.get()
         self.cfg.save()
-        self._run_bg(lambda: [self.ops.install_app(a) for a in APPS])
+        n = len(APPS)
+
+        def run():
+            try:
+                for i, a in enumerate(APPS, start=1):
+                    self._enqueue_task_progress(
+                        i, n, f"Installing {a['name']} ({i}/{n})…")
+                    self.ops.install_app(a)
+            finally:
+                self._enqueue_clear_task_progress()
+
+        self._run_bg(run)
 
     def _uninstall_all(self):
         if not messagebox.askyesno("Uninstall All", "Uninstall ALL apps?"):
@@ -266,7 +781,18 @@ class App:
             "Remove data/config?",
             "Also remove data/config folders for ALL apps?\n\n"
             "This is more destructive and may remove your settings and databases.")
-        self._run_bg(lambda: [self.ops.uninstall_app(a, remove_data=remove_data) for a in APPS])
+        n = len(APPS)
+
+        def run():
+            try:
+                for i, a in enumerate(APPS, start=1):
+                    self._enqueue_task_progress(
+                        i, n, f"Uninstalling {a['name']} ({i}/{n})…")
+                    self.ops.uninstall_app(a, remove_data=remove_data)
+            finally:
+                self._enqueue_clear_task_progress()
+
+        self._run_bg(run)
 
     def _auto_configure(self):
         if not messagebox.askyesno(
@@ -280,19 +806,34 @@ class App:
                 "All apps must already be installed and running.\n"
                 "Existing settings will NOT be overwritten. Continue?"):
             return
-        self._run_bg(self.ops.configure_all)
+
+        def run():
+            try:
+                def progress(step, total, label):
+                    self._enqueue_task_progress(step, total, f"Auto-Configure: {label}")
+
+                self.ops.configure_all(progress_cb=progress)
+            finally:
+                self._enqueue_clear_task_progress()
+
+        self._run_bg(run)
 
     # --- Backup / Restore tab ---
 
     def _build_backup_tab(self):
         outer = ttk.Frame(self.nb)
+        self._backup_outer = outer
         self.nb.add(outer, text="  Backup & Restore  ")
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        lf = tk.LabelFrame(outer, text=" Backup ", font=F_BOLD, padx=10, pady=10)
-        self._tw_add(lf, bg="lf_bg", fg="lf_fg")
+        lf = tk.LabelFrame(
+            outer, text=" Backup ", font=F_BOLD, padx=10, pady=10,
+            highlightthickness=0)
+        self._backup_lf = lf
+        self._tw_label_frame(lf)
         lf.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
         lf.columnconfigure(0, weight=1)
 
@@ -317,8 +858,11 @@ class App:
                        style="Small.TButton",
                        command=lambda a=app: self._backup_one(a)).pack(anchor="w", pady=1)
 
-        rf = tk.LabelFrame(outer, text=" Restore ", font=F_BOLD, padx=10, pady=10)
-        self._tw_add(rf, bg="lf_bg", fg="lf_fg")
+        rf = tk.LabelFrame(
+            outer, text=" Restore ", font=F_BOLD, padx=10, pady=10,
+            highlightthickness=0)
+        self._backup_rf = rf
+        self._tw_label_frame(rf)
         rf.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
         rf.columnconfigure(0, weight=1)
         rf.rowconfigure(1, weight=1)
@@ -351,6 +895,7 @@ class App:
         btn.pack(side="left")
         self._action_buttons.append(btn)
         self._refresh_backup_list()
+        self._layout_backup_columns()
 
     def _refresh_backup_list(self):
         self.backup_list.delete(0, "end")
@@ -424,6 +969,8 @@ class App:
         self.nb.add(outer, text="  Settings  ")
         canvas = tk.Canvas(outer, highlightthickness=0)
         self._tw_add(canvas, bg="bg")
+        self._tw.append(lambda t, w=canvas: w.configure(
+            highlightbackground=t["bg"], highlightcolor=t["bg"]))
         vsb    = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -435,6 +982,12 @@ class App:
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=canvas.winfo_width()))
         self._bind_scroll(outer, canvas)
         self._setting_vars = {}
+        self._bool_setting_vars = {
+            "auto_refresh_enabled": tk.BooleanVar(
+                value=bool(self.cfg.get("auto_refresh_enabled"))),
+            "quiet_hours_enabled": tk.BooleanVar(
+                value=bool(self.cfg.get("quiet_hours_enabled"))),
+        }
 
         row_idx = [0]
 
@@ -483,26 +1036,179 @@ class App:
         hint.grid(row=row_idx[0], column=1, sticky="w", pady=(0, 6))
         row_idx[0] += 1
 
-        inner.columnconfigure(1, weight=1)
-        ttk.Button(inner, text="Save Settings", style="Accent.TButton",
-                   command=self._save_settings).grid(
-            row=row_idx[0], column=0, columnspan=3, pady=14, padx=14, sticky="w")
+        section("Status refresh")
+        ttk.Checkbutton(
+            inner, text="Enable automatic status refresh (Dashboard)",
+            variable=self._bool_setting_vars["auto_refresh_enabled"]).grid(
+                row=row_idx[0], column=1, sticky="w", padx=4, pady=2)
+        row_idx[0] += 1
+        field("Refresh interval (seconds)", "poll_interval_seconds")
+        ttk.Checkbutton(
+            inner, text="Quiet hours — pause refresh between start and end",
+            variable=self._bool_setting_vars["quiet_hours_enabled"]).grid(
+                row=row_idx[0], column=1, sticky="w", padx=4, pady=2)
+        row_idx[0] += 1
+        field("Quiet hours start (24h)", "quiet_hours_start")
+        field("Quiet hours end (24h)", "quiet_hours_end")
 
-    _PORT_KEYS = {"jellyfin_port", "sonarr_port", "radarr_port", "bazarr_port",
-                   "prowlarr_port", "qb_port", "byparr_port", "seer_port"}
+        section("Settings file")
+        frow = ttk.Frame(inner)
+        frow.grid(row=row_idx[0], column=0, columnspan=3, sticky="w", padx=14, pady=4)
+        row_idx[0] += 1
+        ttk.Button(frow, text="Export settings…", style="Small.TButton",
+                   command=self._export_settings).pack(side="left", padx=(0, 8))
+        ttk.Button(frow, text="Import settings…", style="Small.TButton",
+                   command=self._import_settings).pack(side="left")
+
+        inner.columnconfigure(1, weight=1)
+        srow = ttk.Frame(inner)
+        srow.grid(row=row_idx[0], column=0, columnspan=3, pady=14, padx=14, sticky="w")
+        b_save = ttk.Button(srow, text="Save Settings", style="Accent.TButton",
+                            command=self._save_settings)
+        b_save.pack(side="left", padx=(0, 8))
+        b_json = ttk.Button(srow, text="Advanced JSON…", style="Small.TButton",
+                            command=self._edit_json_advanced)
+        b_json.pack(side="left")
+        _Tooltip(b_save, "Validate paths and ports, then write media-stack-config.json.", self)
+        _Tooltip(b_json, "Edit the raw JSON (expert). Validates before save.", self)
+
+    def _reload_settings_from_cfg(self):
+        for key, var in self._setting_vars.items():
+            var.set(str(self.cfg[key]))
+        for key, var in getattr(self, "_bool_setting_vars", {}).items():
+            var.set(bool(self.cfg.get(key)))
+        for key, var in getattr(self, "_checklist_vars", {}).items():
+            var.set(bool(self.cfg.get(key)))
+
+    def _edit_json_advanced(self):
+        from constants import CONF_FILE
+        top = tk.Toplevel(self.root)
+        top.title("Advanced — config JSON")
+        top.geometry("680x560")
+        top.transient(self.root)
+        th = self._t()
+        top.configure(bg=th["bg"])
+        txt = scrolledtext.ScrolledText(
+            top, font=F_MONO, wrap="none", height=24,
+            bg=th["entry_bg"], fg=th["fg"], insertbackground=th["fg"],
+            relief="flat", borderwidth=0)
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", json.dumps(self.cfg.data, indent=2))
+        self._json_editor_win = top
+        self._json_editor_txt = txt
+
+        def _json_destroy(event):
+            if event.widget is top:
+                self._json_editor_win = None
+                self._json_editor_txt = None
+
+        top.bind("<Destroy>", _json_destroy)
+
+        def save_json():
+            raw = txt.get("1.0", "end").strip()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                messagebox.showerror("Invalid JSON", str(e))
+                return
+            if not isinstance(data, dict):
+                messagebox.showerror("Invalid JSON", "Root must be a JSON object.")
+                return
+            merged = {**DEFAULTS, **data}
+            self.cfg.data = merged
+            errs = self.cfg.validate()
+            if errs:
+                messagebox.showwarning(
+                    "Validation failed",
+                    "Fix these issues, then save again:\n\n" + "\n".join(errs))
+                return
+            self.cfg.save()
+            self._reload_settings_from_cfg()
+            self.base_var.set(self.cfg["base_root"])
+            self.log(f"Settings saved from JSON editor ({CONF_FILE.name}).", "ok")
+            self._theme_name = self.cfg.get("theme", "light")
+            self._apply_theme()
+            top.destroy()
+
+        bf = ttk.Frame(top)
+        bf.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bf, text="Save", style="Accent.TButton", command=save_json).pack(side="right")
+        ttk.Button(bf, text="Cancel", style="Small.TButton", command=top.destroy).pack(side="right", padx=(0, 8))
+
+    def _export_settings(self):
+        from constants import CONF_FILE
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+            initialfile=f"{CONF_FILE.stem}-export.json",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps(self.cfg.data, indent=2), encoding="utf-8")
+            self.log(f"Exported settings to {path}", "ok")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def _import_settings(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if not messagebox.askyesno(
+                "Import settings",
+                "Replace current settings with this file?\n\n"
+                "Invalid paths will fail validation. Continue?"):
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("File must contain a JSON object.")
+            self.cfg.data = {**DEFAULTS, **data}
+            errs = self.cfg.validate()
+            if errs:
+                messagebox.showwarning(
+                    "Validation failed",
+                    "Fix the file or your folders, then try again:\n\n" + "\n".join(errs))
+                return
+            self.cfg.save()
+            self._reload_settings_from_cfg()
+            self.base_var.set(self.cfg["base_root"])
+            self.log(f"Imported settings from {path}", "ok")
+            self._theme_name = self.cfg.get("theme", "light")
+            self._apply_theme()
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e))
 
     def _save_settings(self):
         for key, var in self._setting_vars.items():
             val = var.get()
-            if key in self._PORT_KEYS:
+            if key in CONFIG_PORT_KEYS:
                 if not val.isdigit() or not (1 <= int(val) <= 65535):
                     messagebox.showwarning("Invalid port",
                         f"{key} must be a number between 1 and 65535.")
                     return
+            if key == "poll_interval_seconds":
+                if not val.strip().isdigit() or not (15 <= int(val.strip()) <= 3600):
+                    messagebox.showwarning(
+                        "Invalid value",
+                        "Refresh interval must be between 15 and 3600 seconds.")
+                    return
             self.cfg[key] = val
+        for key, var in getattr(self, "_bool_setting_vars", {}).items():
+            self.cfg[key] = var.get()
+        errs = self.cfg.validate()
+        if errs:
+            messagebox.showwarning(
+                "Validation failed",
+                "Fix these issues before saving:\n\n" + "\n".join(errs))
+            return
         self.cfg.save()
         self.base_var.set(self.cfg["base_root"])
         self.log("Settings saved.", "ok")
+        self._theme_name = self.cfg.get("theme", "light")
+        self._apply_theme()
 
     # --- Log ---
 

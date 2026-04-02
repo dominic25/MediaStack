@@ -3,7 +3,7 @@ Shared constants for Media Stack Manager.
 """
 from pathlib import Path
 
-VERSION   = "1.1"
+VERSION   = "1.3"
 CONF_FILE = Path(__file__).with_name("media-stack-config.json")
 
 # Accent and log colors are fixed across themes
@@ -37,6 +37,9 @@ THEMES = {
         "status_warn":"#b71c1c",
         "status_info":"#1565c0",
         "status_dim": "#888888",
+        "tooltip_bg":   "#fffde7",
+        "tooltip_fg":   "#111111",
+        "tooltip_border": "#c5c5c5",
     },
     "dark": {
         "bg":         "#1e1e2e",
@@ -56,8 +59,52 @@ THEMES = {
         "status_warn":"#f38ba8",
         "status_info":"#89b4fa",
         "status_dim": "#6c7086",
+        "tooltip_bg":   "#313244",
+        "tooltip_fg":   "#cdd6f4",
+        "tooltip_border": "#45475a",
     },
 }
+
+HELP_FAQ = """
+FREQUENTLY ASKED QUESTIONS
+
+What is Media Stack Manager?
+  A Windows helper to install, configure, back up, and restore common media apps
+  (Jellyfin, *arr, qBittorrent, Docker helpers) from one place.
+
+Why run as Administrator?
+  Starting/stopping Windows services and some installers expect elevation. The app
+  relaunches elevated automatically when possible.
+
+What does Auto-Configure do?
+  Writes paths and client links (qBittorrent, Sonarr/Radarr, Prowlarr, Bazarr) and
+  adds Jellyfin libraries if an API key is set in Settings. It does not wipe existing
+  settings.
+
+Where is the config file?
+  media-stack-config.json next to the application. Back it up before experiments.
+
+Jellyfin libraries need an API key
+  Dashboard → Advanced → API Keys. Paste the key in Settings for Auto-Configure.
+
+Docker apps (Byparr, Seer)
+  Require Docker Desktop (or Engine) running. Install Docker and ensure `docker info` works.
+
+Backups
+  Use Backup & Restore. Restores rename existing folders to .bak_TIMESTAMP first.
+
+Dashboard
+  Double-click an app card to open its local web UI when the app is installed.
+  Adjust automatic refresh under Settings → Status refresh (interval and quiet hours).
+  Export or import the full JSON config under Settings → Settings file.
+
+Long operations
+  Install All, Uninstall All, and Auto-Configure show step progress above the log.
+
+Need more help?
+  Jellyfin: https://jellyfin.org/docs/
+  Sonarr / Radarr / Prowlarr: see each project's wiki.
+"""
 
 APPS = [
     {
@@ -131,6 +178,12 @@ APPS = [
     },
 ]
 
+CONFIG_PORT_KEYS = (
+    "jellyfin_port", "sonarr_port", "radarr_port", "bazarr_port",
+    "prowlarr_port", "qb_port", "byparr_port", "seer_port",
+)
+CONFIG_FOLDER_KEYS = ("base_root", "media_root", "downloads_root", "backup_root")
+
 DEFAULTS = {
     "base_root":       r"C:\MediaStack",
     "media_root":      r"C:\MediaStack\Media",
@@ -148,4 +201,15 @@ DEFAULTS = {
     "byparr_image":    "thetadev256/byparr:latest",
     "seer_image":      "seerr/seerr:latest",
     "theme":           "light",
+    "onboarding_complete": False,
+    "auto_refresh_enabled": True,
+    "poll_interval_seconds": 45,
+    "quiet_hours_enabled": False,
+    "quiet_hours_start": "22:00",
+    "quiet_hours_end": "07:00",
+    "checklist_folders_saved": False,
+    "checklist_deps_reviewed": False,
+    "checklist_apps_installed": False,
+    "checklist_auto_configure_done": False,
+    "checklist_jellyfin_api": False,
 }
