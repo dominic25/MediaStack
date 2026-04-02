@@ -343,6 +343,345 @@ class Ops:
         if r.returncode == 0: self.log(f"  {name} started on port {port_host}.", "ok")
         else:                 self.log(f"  docker run failed: {r.stderr.strip()}", "err")
 
+    # --- auto-configure helpers ---
+
+    def _read_arr_xml(self, config_dir):
+        """Parse config.xml -> (api_key, port). Returns (None, None) on failure."""
+        import xml.etree.ElementTree as ET
+        xml_path = Path(config_dir) / "config.xml"
+        if not xml_path.exists():
+            return None, None
+        try:
+            root = ET.parse(xml_path).getroot()
+            return root.findtext("ApiKey"), root.findtext("Port")
+        except Exception:
+            return None, None
+
+    def _wait_for_api(self, url, headers, name="", timeout=90):
+        """Poll url every 4 s until it returns 200 or timeout expires."""
+        self.log(f"  Waiting for {name} API to be ready ...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.http_get(url, headers)
+                self.log(f"  {name} API is up.", "ok")
+                return True
+            except Exception:
+                time.sleep(4)
+        self.log(f"  {name} API did not respond within {timeout}s.", "err")
+        return False
+
+    def _wait_for_config_xml(self, app, timeout=90):
+        """Wait for an *arr app to generate its config.xml on first start."""
+        cfg_dir = self.resolve_path(app.get("config_paths", []))
+        if not cfg_dir:
+            self.log(f"  Config dir not found for {app['name']}.", "err")
+            return None, None
+        xml_path = cfg_dir / "config.xml"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if xml_path.exists():
+                key, port = self._read_arr_xml(cfg_dir)
+                if key:
+                    return key, port
+            self.log(f"  Waiting for {app['name']} config.xml ...")
+            time.sleep(5)
+        self.log(f"  {app['name']} config.xml not ready after {timeout}s.", "err")
+        return None, None
+
+    def _configure_arr_app(self, app, root_folder, qbit_category, qbit_port, api_key, port):
+        """Set root folder and qBittorrent download client on a Sonarr/Radarr instance."""
+        name    = app["name"]
+        version = app["arr_version"]
+        base    = f"http://localhost:{port}/api/{version}"
+        hdrs    = {"X-Api-Key": api_key, "Content-Type": "application/json"}
+
+        if not self._wait_for_api(f"{base}/system/status", hdrs, name=name):
+            return False
+
+        # Root folder
+        try:
+            folders  = self.http_get(f"{base}/rootfolder", hdrs)
+            existing = [f["path"].lower() for f in folders]
+            if root_folder.lower() not in existing:
+                self.http_post(f"{base}/rootfolder", hdrs, json.dumps({"path": root_folder}))
+                self.log(f"  Root folder added: {root_folder}", "ok")
+            else:
+                self.log(f"  Root folder already set.", "ok")
+        except Exception as e:
+            self.log(f"  Root folder config failed: {e}", "warn")
+
+        # qBittorrent download client
+        try:
+            clients  = self.http_get(f"{base}/downloadclient", hdrs)
+            has_qbit = any(c.get("implementation") == "QBittorrent" for c in clients)
+            if not has_qbit:
+                cat_key = "tvCategory" if name == "Sonarr" else "movieCategory"
+                body = {
+                    "enable": True, "protocol": "torrent", "priority": 1,
+                    "name": "qBittorrent",
+                    "fields": [
+                        {"name": "host",      "value": "localhost"},
+                        {"name": "port",      "value": int(qbit_port)},
+                        {"name": "useSsl",    "value": False},
+                        {"name": "urlBase",   "value": ""},
+                        {"name": "username",  "value": ""},
+                        {"name": "password",  "value": ""},
+                        {"name": cat_key,     "value": qbit_category},
+                        {"name": "initialState",     "value": 0},
+                        {"name": "sequentialOrder",  "value": False},
+                        {"name": "firstAndLast",     "value": False},
+                    ],
+                    "implementationName": "qBittorrent",
+                    "implementation": "QBittorrent",
+                    "configContract": "QBittorrentSettings",
+                    "tags": []
+                }
+                self.http_post(f"{base}/downloadclient", hdrs, json.dumps(body))
+                self.log(f"  qBittorrent download client added.", "ok")
+            else:
+                self.log(f"  qBittorrent already configured.", "ok")
+        except Exception as e:
+            self.log(f"  Download client config failed: {e}", "warn")
+
+        return True
+
+    def configure_qbittorrent(self):
+        """Write qBittorrent.conf with WebUI settings and download path."""
+        candidates = [r"%APPDATA%\qBittorrent", r"C:\ProgramData\qBittorrent"]
+        cfg_dir = self.resolve_path(candidates)
+        if cfg_dir is None:
+            cfg_dir = Path(os.path.expandvars(r"%APPDATA%\qBittorrent"))
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+
+        conf_path   = cfg_dir / "qBittorrent.conf"
+        port        = self.cfg["qb_port"]
+        dl_root     = self.cfg["downloads_root"].replace("\\", "/")
+        incomplete  = (Path(self.cfg["downloads_root"]) / "incomplete").as_posix()
+
+        cp = configparser.ConfigParser(strict=False)
+        cp.optionxform = str   # preserve key case
+        if conf_path.exists():
+            cp.read(conf_path, encoding="utf-8")
+
+        for sec in ("BitTorrent", "LegalNotice", "Preferences"):
+            if not cp.has_section(sec):
+                cp.add_section(sec)
+
+        cp.set("BitTorrent",  "Session\\DefaultSavePath",  dl_root + "/")
+        cp.set("BitTorrent",  "Session\\TempPath",          incomplete + "/")
+        cp.set("LegalNotice", "Accepted",                   "true")
+        cp.set("Preferences", "WebUI\\Enabled",             "true")
+        cp.set("Preferences", "WebUI\\Port",                str(port))
+        cp.set("Preferences", "WebUI\\LocalHostAuth",       "false")
+
+        with open(conf_path, "w", encoding="utf-8") as f:
+            cp.write(f)
+
+        # Ensure download dirs exist
+        Path(self.cfg["downloads_root"]).mkdir(parents=True, exist_ok=True)
+        Path(incomplete).mkdir(parents=True, exist_ok=True)
+        self.log(f"  Written: {conf_path}", "ok")
+        return True
+
+    def configure_prowlarr(self, sonarr_key, sonarr_port, radarr_key, radarr_port,
+                           prowlarr_key, prowlarr_port):
+        """Connect Prowlarr to Sonarr and Radarr."""
+        base = f"http://localhost:{prowlarr_port}/api/v1"
+        hdrs = {"X-Api-Key": prowlarr_key, "Content-Type": "application/json"}
+
+        if not self._wait_for_api(f"{base}/system/status", hdrs, name="Prowlarr"):
+            return False
+
+        try:
+            apps     = self.http_get(f"{base}/applications", hdrs)
+            existing = {a.get("implementation") for a in apps}
+            pl_url   = f"http://localhost:{prowlarr_port}"
+
+            for impl, name, api_key, port, cats in [
+                ("Sonarr", "Sonarr", sonarr_key, sonarr_port,
+                 [5000, 5010, 5020, 5030, 5040, 5045, 5050]),
+                ("Radarr", "Radarr", radarr_key, radarr_port,
+                 [2000, 2010, 2020, 2030, 2040, 2045, 2050]),
+            ]:
+                if impl in existing:
+                    self.log(f"  Prowlarr -> {name} already linked.", "ok")
+                    continue
+                body = {
+                    "syncLevel": "fullSync", "name": name,
+                    "fields": [
+                        {"name": "prowlarrUrl",    "value": pl_url},
+                        {"name": "baseUrl",        "value": f"http://localhost:{port}"},
+                        {"name": "apiKey",         "value": api_key},
+                        {"name": "syncCategories", "value": cats},
+                    ],
+                    "implementationName": impl,
+                    "implementation":     impl,
+                    "configContract":     f"{impl}Settings",
+                    "tags": []
+                }
+                self.http_post(f"{base}/applications", hdrs, json.dumps(body))
+                self.log(f"  Prowlarr -> {name} linked.", "ok")
+        except Exception as e:
+            self.log(f"  Prowlarr link failed: {e}", "warn")
+
+        return True
+
+    def configure_bazarr(self, sonarr_key, sonarr_port, radarr_key, radarr_port):
+        """Write Bazarr config.ini with Sonarr + Radarr connection details."""
+        cfg_dir = self.resolve_path([r"C:\ProgramData\Bazarr", r"%APPDATA%\Bazarr"])
+        if cfg_dir is None:
+            cfg_dir = Path(os.path.expandvars(r"C:\ProgramData\Bazarr"))
+        config_sub = cfg_dir / "config"
+        config_sub.mkdir(parents=True, exist_ok=True)
+        ini_path = config_sub / "config.ini"
+
+        cp = configparser.ConfigParser(strict=False)
+        cp.optionxform = str
+        if ini_path.exists():
+            cp.read(ini_path, encoding="utf-8")
+
+        def ensure(section, items):
+            if not cp.has_section(section):
+                cp.add_section(section)
+            for k, v in items.items():
+                cp.set(section, k, str(v))
+
+        ensure("sonarr", {
+            "enabled": "True", "apikey": sonarr_key or "",
+            "host": "localhost", "port": str(sonarr_port), "ssl": "False",
+        })
+        ensure("radarr", {
+            "enabled": "True", "apikey": radarr_key or "",
+            "host": "localhost", "port": str(radarr_port), "ssl": "False",
+        })
+
+        with open(ini_path, "w", encoding="utf-8") as f:
+            cp.write(f)
+        self.log(f"  Written: {ini_path}", "ok")
+        return True
+
+    def configure_jellyfin(self):
+        """Add Movies and TV libraries to Jellyfin via API."""
+        port    = self.cfg["jellyfin_port"]
+        api_key = self.cfg["jellyfin_api_key"]
+        if not api_key:
+            self.log("  No Jellyfin API key set in Settings. Skipping library setup.", "warn")
+            return False
+        base = f"http://localhost:{port}"
+        hdrs = {"X-MediaBrowser-Token": api_key, "Content-Type": "application/json"}
+
+        if not self._wait_for_api(f"{base}/System/Info", hdrs, name="Jellyfin"):
+            return False
+
+        media_root = Path(self.cfg["media_root"])
+        libs = [
+            ("Movies",   str(media_root / "Movies"), "movies"),
+            ("TV Shows", str(media_root / "TV"),      "tvshows"),
+        ]
+
+        try:
+            folders = self.http_get(f"{base}/Library/VirtualFolders", hdrs)
+            existing_paths = set()
+            for f in folders:
+                for loc in f.get("Locations", []):
+                    existing_paths.add(loc.lower())
+
+            for lib_name, path, col_type in libs:
+                Path(path).mkdir(parents=True, exist_ok=True)
+                if path.lower() in existing_paths:
+                    self.log(f"  Jellyfin library '{lib_name}' already exists.", "ok")
+                    continue
+                body = {
+                    "Name": lib_name,
+                    "Paths": [path],
+                    "PathInfos": [{"Path": path}],
+                    "EnableRealTimeMonitor": True,
+                }
+                url = (f"{base}/Library/VirtualFolders"
+                       f"?collectionType={col_type}&refreshLibrary=false")
+                self.http_post(url, hdrs, json.dumps(body))
+                self.log(f"  Jellyfin library added: {lib_name} -> {path}", "ok")
+        except Exception as e:
+            self.log(f"  Jellyfin library config failed: {e}", "warn")
+
+        return True
+
+    def configure_all(self):
+        """Orchestrate post-install configuration for the full stack."""
+        self.log("=== Auto-Configure ===", "bold")
+
+        # 0. Ensure media / download dirs exist
+        for key in ("media_root", "downloads_root"):
+            Path(self.cfg[key]).mkdir(parents=True, exist_ok=True)
+        for sub in ("Movies", "TV"):
+            (Path(self.cfg["media_root"]) / sub).mkdir(parents=True, exist_ok=True)
+
+        # 1. qBittorrent - config file only, no API needed
+        self.log("")
+        self.log("--- qBittorrent ---", "bold")
+        self.configure_qbittorrent()
+
+        # 2. Collect *arr API keys (apps must already be running to generate config.xml)
+        arr_info = {}
+        arr_apps = {a["name"]: a for a in APPS if a.get("arr_version")}
+        for name, app in arr_apps.items():
+            self.log("")
+            self.log(f"--- {name} (reading config) ---", "bold")
+            key, port = self._wait_for_config_xml(app)
+            if key:
+                arr_info[name] = {"key": key, "port": port, "app": app}
+                self.log(f"  {name} API key found.", "ok")
+            else:
+                self.log(f"  Skipping {name} configuration.", "warn")
+
+        sonarr   = arr_info.get("Sonarr",   {})
+        radarr   = arr_info.get("Radarr",   {})
+        prowlarr = arr_info.get("Prowlarr", {})
+
+        # 3. Sonarr
+        if sonarr:
+            self.log("")
+            self.log("--- Sonarr ---", "bold")
+            tv_path = str(Path(self.cfg["media_root"]) / "TV")
+            self._configure_arr_app(
+                sonarr["app"], tv_path, "sonarr",
+                self.cfg["sonarr_port"], sonarr["key"], sonarr["port"])
+
+        # 4. Radarr
+        if radarr:
+            self.log("")
+            self.log("--- Radarr ---", "bold")
+            movies_path = str(Path(self.cfg["media_root"]) / "Movies")
+            self._configure_arr_app(
+                radarr["app"], movies_path, "radarr",
+                self.cfg["radarr_port"], radarr["key"], radarr["port"])
+
+        # 5. Prowlarr (link Sonarr + Radarr)
+        if prowlarr and sonarr and radarr:
+            self.log("")
+            self.log("--- Prowlarr ---", "bold")
+            self.configure_prowlarr(
+                sonarr["key"],   sonarr["port"],
+                radarr["key"],   radarr["port"],
+                prowlarr["key"], prowlarr["port"])
+
+        # 6. Bazarr
+        if sonarr or radarr:
+            self.log("")
+            self.log("--- Bazarr ---", "bold")
+            self.configure_bazarr(
+                sonarr.get("key", ""),  sonarr.get("port",  self.cfg["sonarr_port"]),
+                radarr.get("key", ""),  radarr.get("port",  self.cfg["radarr_port"]))
+
+        # 7. Jellyfin libraries
+        self.log("")
+        self.log("--- Jellyfin ---", "bold")
+        self.configure_jellyfin()
+
+        self.log("")
+        self.log("=== Auto-Configure complete ===", "bold")
+
     # --- backup helpers ---
 
     def _arr_api_backup(self, app, config_dir, backup_set):
@@ -734,6 +1073,8 @@ class App:
                    command=self._refresh_status).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="Install All", style="Accent.TButton",
                    command=self._install_all).pack(side="right")
+        ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
+                   command=self._auto_configure).pack(side="right", padx=(0, 6))
 
         cf = ttk.Frame(outer)
         cf.pack(fill="both", expand=True, padx=12, pady=4)
@@ -825,6 +1166,20 @@ class App:
         self.cfg["base_root"] = self.base_var.get()
         self.cfg.save()
         self._run_bg(lambda: [self.ops.install_app(a) for a in APPS])
+
+    def _auto_configure(self):
+        if not messagebox.askyesno(
+                "Auto-Configure",
+                "This will configure all apps automatically:\n\n"
+                "  - qBittorrent: WebUI port, download path\n"
+                "  - Sonarr/Radarr: root folder, qBittorrent client\n"
+                "  - Prowlarr: link Sonarr + Radarr\n"
+                "  - Bazarr: write Sonarr + Radarr connections\n"
+                "  - Jellyfin: add Movies + TV libraries (needs API key in Settings)\n\n"
+                "All apps must already be installed and running.\n"
+                "Existing settings will NOT be overwritten. Continue?"):
+            return
+        self._run_bg(self.ops.configure_all)
 
     # --- Backup / Restore tab ---
 
