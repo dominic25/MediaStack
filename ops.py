@@ -517,12 +517,16 @@ class Ops:
                 return False
             root    = ET.parse(xml_path).getroot()
             api_key = root.findtext("ApiKey")
+            if not api_key:
+                self.log(f"  No API key found in {xml_path}", "err")
+                return False
             port    = root.findtext("Port") or port
             base    = f"http://localhost:{port}/api/{version}"
             hdrs    = {"X-Api-Key": api_key, "Content-Type": "application/json"}
             self.log(f"  Triggering {name} API backup on port {port} ...")
             result = self.http_post(f"{base}/command", hdrs, '{"name":"Backup"}')
             cmd_id = result["id"]
+            status = {"status": "unknown"}
             deadline = time.time() + 120
             while time.time() < deadline:
                 time.sleep(3)
@@ -647,7 +651,7 @@ class Ops:
         bks    = Path(self.cfg["backup_root"])
         bks.mkdir(parents=True, exist_ok=True)
         bk_set = bks / ts
-        bk_set.mkdir()
+        bk_set.mkdir(exist_ok=True)
         self.log(f"=== BACKUP -> {bk_set} ===", "bold")
         results = []
         for app in APPS:
@@ -741,7 +745,13 @@ class Ops:
             if dest.exists():
                 bak = Path(str(dest) + f".bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                 self.log(f"  Renaming existing -> {bak.name}", "warn")
-                dest.rename(bak)
+                try:
+                    dest.rename(bak)
+                except Exception as e:
+                    self.log(f"  Failed to rename {dest}: {e}", "err")
+                    self.start_app(app)
+                    results.append((name, "FAILED"))
+                    continue
             try:
                 dest.mkdir(parents=True, exist_ok=True)
                 with zipfile.ZipFile(zip_path, "r") as zf:

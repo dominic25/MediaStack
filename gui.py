@@ -24,6 +24,8 @@ class App:
         self._tw  = []
         self._status_labels = {}
         self._backup_sets   = []
+        self._busy = False
+        self._action_buttons = []
 
         self._theme_name = self.cfg.get("theme", "light")
 
@@ -31,6 +33,7 @@ class App:
         self.root.title(f"Media Stack Manager v{VERSION}")
         self.root.geometry("1050x740")
         self.root.minsize(800, 600)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._setup_styles()
         self._build_header()
@@ -40,6 +43,9 @@ class App:
         self._apply_theme()
         self._check_queue()
 
+        if self.cfg.load_error:
+            self.log(f"WARNING: Config file could not be loaded: {self.cfg.load_error}", "warn")
+            self.log("Using default settings.", "warn")
         if not ctypes.windll.shell32.IsUserAnAdmin():
             self.log("WARNING: Not running as Administrator. Some operations may fail.", "warn")
 
@@ -142,10 +148,14 @@ class App:
                    command=self._browse_base).pack(side="left")
         ttk.Button(top, text="Refresh Status", style="Small.TButton",
                    command=self._refresh_status).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="Install All", style="Accent.TButton",
-                   command=self._install_all).pack(side="right")
-        ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
-                   command=self._auto_configure).pack(side="right", padx=(0, 6))
+        btn = ttk.Button(top, text="Install All", style="Accent.TButton",
+                   command=self._install_all)
+        btn.pack(side="right")
+        self._action_buttons.append(btn)
+        btn = ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
+                   command=self._auto_configure)
+        btn.pack(side="right", padx=(0, 6))
+        self._action_buttons.append(btn)
 
         cf = ttk.Frame(outer)
         cf.pack(fill="both", expand=True, padx=12, pady=4)
@@ -203,10 +213,10 @@ class App:
     def _refresh_status(self):
         def run():
             for app in APPS:
-                name, color_key = app["name"], None
                 label, color_key = self.ops.check_app_status(app)
-                self.root.after(0, lambda n=name, lb=label, ck=color_key:
-                               self._set_status(n, lb, ck))
+                name = app["name"]
+                self.q.put(lambda n=name, lb=label, ck=color_key:
+                           self._set_status(n, lb, ck))
         self._run_bg(run)
 
     def _set_status(self, name, label, color_key):
@@ -266,8 +276,10 @@ class App:
         self._tw_add(desc, bg="lf_bg", fg="fg")
         desc.pack(anchor="w")
 
-        ttk.Button(lf, text="Back Up All Now", style="Accent.TButton",
-                   command=self._do_backup).pack(anchor="w", pady=(12, 4))
+        btn = ttk.Button(lf, text="Back Up All Now", style="Accent.TButton",
+                   command=self._do_backup)
+        btn.pack(anchor="w", pady=(12, 4))
+        self._action_buttons.append(btn)
 
         sep_lbl = tk.Label(lf, text="Individual apps:", font=F_MAIN, anchor="w")
         self._tw_add(sep_lbl, bg="lf_bg", fg="fg_dim")
@@ -304,10 +316,14 @@ class App:
         btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(btn_row, text="Refresh", style="Small.TButton",
                    command=self._refresh_backup_list).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_row, text="Restore Selected", style="Accent.TButton",
-                   command=self._do_restore).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_row, text="Delete Selected", style="Small.TButton",
-                   command=self._delete_backup).pack(side="left")
+        btn = ttk.Button(btn_row, text="Restore Selected", style="Accent.TButton",
+                   command=self._do_restore)
+        btn.pack(side="left", padx=(0, 4))
+        self._action_buttons.append(btn)
+        btn = ttk.Button(btn_row, text="Delete Selected", style="Small.TButton",
+                   command=self._delete_backup)
+        btn.pack(side="left")
+        self._action_buttons.append(btn)
         self._refresh_backup_list()
 
     def _refresh_backup_list(self):
@@ -319,7 +335,7 @@ class App:
 
     def _do_backup(self):
         def after(results):
-            self.root.after(0, self._refresh_backup_list)
+            self.q.put(self._refresh_backup_list)
         self._run_bg(lambda: self.ops.backup_all(callback=after))
 
     def _backup_one(self, app):
@@ -342,12 +358,12 @@ class App:
                     self.ops.stop_app(app)
                     self.ops._file_copy_backup(app, src, bk_set)
                     self.ops.start_app(app)
-            self.root.after(0, self._refresh_backup_list)
+            self.q.put(self._refresh_backup_list)
         self._run_bg(run)
 
     def _do_restore(self):
         sel = self.backup_list.curselection()
-        if not sel:
+        if not sel or sel[0] >= len(self._backup_sets):
             messagebox.showwarning("Restore", "Select a backup set from the list first.")
             return
         bk = self._backup_sets[sel[0]]
@@ -360,7 +376,7 @@ class App:
     def _delete_backup(self):
         import shutil
         sel = self.backup_list.curselection()
-        if not sel:
+        if not sel or sel[0] >= len(self._backup_sets):
             messagebox.showwarning("Delete", "Select a backup set to delete.")
             return
         bk = self._backup_sets[sel[0]]
@@ -446,9 +462,18 @@ class App:
                    command=self._save_settings).grid(
             row=row_idx[0], column=0, columnspan=3, pady=14, padx=14, sticky="w")
 
+    _PORT_KEYS = {"jellyfin_port", "sonarr_port", "radarr_port", "bazarr_port",
+                   "prowlarr_port", "qb_port", "byparr_port", "seer_port"}
+
     def _save_settings(self):
         for key, var in self._setting_vars.items():
-            self.cfg[key] = var.get()
+            val = var.get()
+            if key in self._PORT_KEYS:
+                if not val.isdigit() or not (1 <= int(val) <= 65535):
+                    messagebox.showwarning("Invalid port",
+                        f"{key} must be a number between 1 and 65535.")
+                    return
+            self.cfg[key] = val
         self.cfg.save()
         self.base_var.set(self.cfg["base_root"])
         self.log("Settings saved.", "ok")
@@ -495,12 +520,16 @@ class App:
     def _check_queue(self):
         try:
             while True:
-                msg, tag = self.q.get_nowait()
-                self.log_txt.configure(state="normal")
-                self.log_txt.insert("end", msg + "\n", tag)
-                self.log_txt.see("end")
-                self.log_txt.configure(state="disabled")
-                self.status_var.set(msg[:90] if msg.strip() else "Ready")
+                item = self.q.get_nowait()
+                if callable(item):
+                    item()
+                else:
+                    msg, tag = item
+                    self.log_txt.configure(state="normal")
+                    self.log_txt.insert("end", msg + "\n", tag)
+                    self.log_txt.see("end")
+                    self.log_txt.configure(state="disabled")
+                    self.status_var.set(msg[:90] if msg.strip() else "Ready")
         except queue.Empty:
             pass
         self.root.after(50, self._check_queue)
@@ -510,8 +539,34 @@ class App:
         self.log_txt.delete("1.0", "end")
         self.log_txt.configure(state="disabled")
 
+    def _set_busy(self, busy):
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        for btn in self._action_buttons:
+            try: btn.configure(state=state)
+            except Exception: pass
+        if busy:
+            self.status_var.set("Working...")
+        else:
+            self.status_var.set("Ready")
+
     def _run_bg(self, fn):
-        threading.Thread(target=fn, daemon=True).start()
+        def wrapper():
+            self.q.put(lambda: self._set_busy(True))
+            try:
+                fn()
+            except Exception as e:
+                self.log(f"Error: {e}", "err")
+            finally:
+                self.q.put(lambda: self._set_busy(False))
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _on_close(self):
+        if self._busy:
+            if not messagebox.askyesno("Quit",
+                    "An operation is still running. Quit anyway?"):
+                return
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()
