@@ -1,186 +1,16 @@
-#!/usr/bin/env python3
 """
-media-stack-manager.py - Media Stack Manager
-All-in-one GUI: install, backup, and restore your self-hosted media stack.
-Requirements: Python 3.8+  |  Windows 10/11  |  No pip packages required.
+Backend operations for Media Stack Manager.
+Handles install, configure, backup, and restore of all apps.
 """
-import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
-import subprocess, threading, queue, os, json, shutil, zipfile
-import tempfile, time, sys, ctypes, configparser
-import urllib.request, urllib.error
+import subprocess, os, json, shutil, zipfile, tempfile, time, configparser
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-VERSION   = "1.1"
-CONF_FILE = Path(__file__).with_name("media-stack-config.json")
+from constants import APPS
+from config import Config
 
-# Accent and log colors are fixed across themes
-C_ACCENT   = "#1565c0"
-C_LOG_BG   = "#1e1e1e"
-C_LOG_FG   = "#d4d4d4"
-C_LOG_OK   = "#4ec9b0"
-C_LOG_WRN  = "#ce9178"
-C_LOG_ERR  = "#f48771"
-F_MAIN     = ("Segoe UI", 10)
-F_BOLD     = ("Segoe UI", 10, "bold")
-F_TITLE    = ("Segoe UI", 13, "bold")
-F_MONO     = ("Consolas", 9)
 
-THEMES = {
-    "light": {
-        "bg":         "#f5f5f5",
-        "card":       "#ffffff",
-        "fg":         "#111111",
-        "fg_dim":     "#555555",
-        "entry_bg":   "#ffffff",
-        "listbox_bg": "#ffffff",
-        "listbox_fg": "#111111",
-        "section_fg": "#1565c0",
-        "btn_bg":     "#e0e0e0",
-        "btn_fg":     "#111111",
-        "lf_bg":      "#f5f5f5",
-        "lf_fg":      "#333333",
-        "toggle_lbl": "Dark mode",
-        "status_ok":  "#2e7d32",
-        "status_warn":"#b71c1c",
-        "status_info":"#1565c0",
-        "status_dim": "#888888",
-    },
-    "dark": {
-        "bg":         "#1e1e2e",
-        "card":       "#2a2a3e",
-        "fg":         "#cdd6f4",
-        "fg_dim":     "#a6adc8",
-        "entry_bg":   "#313244",
-        "listbox_bg": "#2a2a3e",
-        "listbox_fg": "#cdd6f4",
-        "section_fg": "#89b4fa",
-        "btn_bg":     "#45475a",
-        "btn_fg":     "#cdd6f4",
-        "lf_bg":      "#1e1e2e",
-        "lf_fg":      "#a6adc8",
-        "toggle_lbl": "Light mode",
-        "status_ok":  "#a6e3a1",
-        "status_warn":"#f38ba8",
-        "status_info":"#89b4fa",
-        "status_dim": "#6c7086",
-    },
-}
-
-APPS = [
-    {
-        "name": "Jellyfin", "desc": "Media server",
-        "install": "browser", "url": "https://jellyfin.org/downloads/windows/server",
-        "service": "Jellyfin", "process": "jellyfin",
-        "exe_candidates": ["jellyfin.exe", "JellyfinTray.exe"],
-        "common_dirs": [r"C:\Program Files\Jellyfin\Server"],
-        "config_paths": [r"C:\ProgramData\Jellyfin\Server", r"%LOCALAPPDATA%\jellyfin"],
-        "backup": "jellyfin_api", "port_key": "jellyfin_port",
-    },
-    {
-        "name": "Sonarr", "desc": "TV show management",
-        "install": "winget", "winget_id": "TeamSonarr.Sonarr",
-        "service": "Sonarr", "process": "Sonarr",
-        "exe_candidates": ["Sonarr.exe"],
-        "common_dirs": [r"C:\Program Files\Sonarr"],
-        "config_paths": [r"C:\ProgramData\Sonarr", r"%APPDATA%\Sonarr"],
-        "backup": "arr_api", "arr_version": "v3", "port_key": "sonarr_port",
-    },
-    {
-        "name": "Radarr", "desc": "Movie management",
-        "install": "winget", "winget_id": "TeamRadarr.Radarr",
-        "service": "Radarr", "process": "Radarr",
-        "exe_candidates": ["Radarr.exe"],
-        "common_dirs": [r"C:\Program Files\Radarr"],
-        "config_paths": [r"C:\ProgramData\Radarr", r"%APPDATA%\Radarr"],
-        "backup": "arr_api", "arr_version": "v3", "port_key": "radarr_port",
-    },
-    {
-        "name": "Prowlarr", "desc": "Indexer management",
-        "install": "winget", "winget_id": "TeamProwlarr.Prowlarr",
-        "service": "Prowlarr", "process": "Prowlarr",
-        "exe_candidates": ["Prowlarr.exe"],
-        "common_dirs": [r"C:\Program Files\Prowlarr"],
-        "config_paths": [r"C:\ProgramData\Prowlarr", r"%APPDATA%\Prowlarr"],
-        "backup": "arr_api", "arr_version": "v1", "port_key": "prowlarr_port",
-    },
-    {
-        "name": "Bazarr", "desc": "Subtitle management",
-        "install": "winget", "winget_id": "Morpheus.Bazarr",
-        "service": "Bazarr", "process": "bazarr",
-        "exe_candidates": ["bazarr.exe", "Bazarr.exe"],
-        "common_dirs": [r"C:\Program Files\Bazarr"],
-        "config_paths": [r"C:\ProgramData\Bazarr", r"%APPDATA%\Bazarr"],
-        "backup": "bazarr_api", "port_key": "bazarr_port",
-    },
-    {
-        "name": "qBittorrent", "desc": "Torrent download client",
-        "install": "winget", "winget_id": "qBittorrent.qBittorrent.lt2",
-        "service": "qBittorrent", "process": "qbittorrent",
-        "exe_candidates": ["qbittorrent.exe", "qBittorrent.exe"],
-        "common_dirs": [r"C:\Program Files\qBittorrent"],
-        "config_paths": [r"%APPDATA%\qBittorrent", r"C:\ProgramData\qBittorrent"],
-        "backup": "file_copy", "port_key": "qb_port",
-    },
-    {
-        "name": "Byparr", "desc": "Cloudflare bypass helper (Docker)",
-        "install": "docker", "docker_image_key": "byparr_image",
-        "container": "byparr", "port_key": "byparr_port",
-        "volume_subpath": "Byparr",
-        "backup": None,
-    },
-    {
-        "name": "Seer", "desc": "Media request manager (Docker)",
-        "install": "docker", "docker_image_key": "seer_image",
-        "container": "seer", "port_key": "seer_port",
-        "volume_subpath": "Seer\\config",
-        "backup": "file_copy",
-    },
-]
-
-DEFAULTS = {
-    "base_root":       r"C:\MediaStack",
-    "media_root":      r"C:\MediaStack\Media",
-    "downloads_root":  r"C:\MediaStack\Downloads",
-    "backup_root":     r"C:\MediaStack\Backups",
-    "jellyfin_port":   "8096",
-    "sonarr_port":     "8989",
-    "radarr_port":     "7878",
-    "bazarr_port":     "6767",
-    "prowlarr_port":   "9696",
-    "qb_port":         "8080",
-    "byparr_port":     "8191",
-    "seer_port":       "5055",
-    "jellyfin_api_key": "",
-    "byparr_image":    "thetadev256/byparr:latest",
-    "seer_image":      "seerr/seerr:latest",
-    "theme":           "light",
-}
-
-class Config:
-    def __init__(self):
-        self.data = dict(DEFAULTS)
-        self.load()
-
-    def load(self):
-        if CONF_FILE.exists():
-            try:
-                saved = json.loads(CONF_FILE.read_text())
-                self.data.update(saved)
-            except Exception:
-                pass
-
-    def save(self):
-        CONF_FILE.write_text(json.dumps(self.data, indent=2))
-
-    def __getitem__(self, k): return self.data.get(k, "")
-    def __setitem__(self, k, v): self.data[k] = v
-    def get(self, k, d=""): return self.data.get(k, d)
-
-# ---------------------------------------------------------------------------
-# Backend (Ops)
-# ---------------------------------------------------------------------------
 class Ops:
     def __init__(self, config: Config, log_fn):
         self.cfg    = config
@@ -460,7 +290,7 @@ class Ops:
         incomplete  = (Path(self.cfg["downloads_root"]) / "incomplete").as_posix()
 
         cp = configparser.ConfigParser(strict=False)
-        cp.optionxform = str   # preserve key case
+        cp.optionxform = str
         if conf_path.exists():
             cp.read(conf_path, encoding="utf-8")
 
@@ -478,7 +308,6 @@ class Ops:
         with open(conf_path, "w", encoding="utf-8") as f:
             cp.write(f)
 
-        # Ensure download dirs exist
         Path(self.cfg["downloads_root"]).mkdir(parents=True, exist_ok=True)
         Path(incomplete).mkdir(parents=True, exist_ok=True)
         self.log(f"  Written: {conf_path}", "ok")
@@ -611,18 +440,15 @@ class Ops:
         """Orchestrate post-install configuration for the full stack."""
         self.log("=== Auto-Configure ===", "bold")
 
-        # 0. Ensure media / download dirs exist
         for key in ("media_root", "downloads_root"):
             Path(self.cfg[key]).mkdir(parents=True, exist_ok=True)
         for sub in ("Movies", "TV"):
             (Path(self.cfg["media_root"]) / sub).mkdir(parents=True, exist_ok=True)
 
-        # 1. qBittorrent - config file only, no API needed
         self.log("")
         self.log("--- qBittorrent ---", "bold")
         self.configure_qbittorrent()
 
-        # 2. Collect *arr API keys (apps must already be running to generate config.xml)
         arr_info = {}
         arr_apps = {a["name"]: a for a in APPS if a.get("arr_version")}
         for name, app in arr_apps.items():
@@ -639,7 +465,6 @@ class Ops:
         radarr   = arr_info.get("Radarr",   {})
         prowlarr = arr_info.get("Prowlarr", {})
 
-        # 3. Sonarr
         if sonarr:
             self.log("")
             self.log("--- Sonarr ---", "bold")
@@ -648,7 +473,6 @@ class Ops:
                 sonarr["app"], tv_path, "sonarr",
                 self.cfg["sonarr_port"], sonarr["key"], sonarr["port"])
 
-        # 4. Radarr
         if radarr:
             self.log("")
             self.log("--- Radarr ---", "bold")
@@ -657,7 +481,6 @@ class Ops:
                 radarr["app"], movies_path, "radarr",
                 self.cfg["radarr_port"], radarr["key"], radarr["port"])
 
-        # 5. Prowlarr (link Sonarr + Radarr)
         if prowlarr and sonarr and radarr:
             self.log("")
             self.log("--- Prowlarr ---", "bold")
@@ -666,7 +489,6 @@ class Ops:
                 radarr["key"],   radarr["port"],
                 prowlarr["key"], prowlarr["port"])
 
-        # 6. Bazarr
         if sonarr or radarr:
             self.log("")
             self.log("--- Bazarr ---", "bold")
@@ -674,7 +496,6 @@ class Ops:
                 sonarr.get("key", ""),  sonarr.get("port",  self.cfg["sonarr_port"]),
                 radarr.get("key", ""),  radarr.get("port",  self.cfg["radarr_port"]))
 
-        # 7. Jellyfin libraries
         self.log("")
         self.log("--- Jellyfin ---", "bold")
         self.configure_jellyfin()
@@ -936,529 +757,3 @@ class Ops:
         self.log("=== Restore Summary ===", "bold")
         for name, status in results:
             self.log(f"  {name:<15} {status}", "ok" if status == "OK" else "err")
-
-# ---------------------------------------------------------------------------
-# GUI
-# ---------------------------------------------------------------------------
-class App:
-    def __init__(self):
-        self.cfg  = Config()
-        self.q    = queue.Queue()
-        self.ops  = Ops(self.cfg, self._enqueue_log)
-        self._tw  = []   # list of callables for theme updates: fn(theme_dict)
-        self._status_labels = {}   # name -> tk.Label for status text
-        self._backup_sets   = []
-
-        self._theme_name = self.cfg.get("theme", "light")
-
-        self.root = tk.Tk()
-        self.root.title(f"Media Stack Manager v{VERSION}")
-        self.root.geometry("1050x740")
-        self.root.minsize(800, 600)
-
-        self._setup_styles()
-        self._build_header()
-        self._build_notebook()
-        self._build_log()
-        self._build_statusbar()
-        self._apply_theme()   # paint initial theme
-        self._check_queue()
-
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            self.log("WARNING: Not running as Administrator. Some operations may fail.", "warn")
-
-    # --- theme ---
-
-    def _t(self):
-        """Return current theme dict."""
-        return THEMES[self._theme_name]
-
-    def _setup_styles(self):
-        t = self._t()
-        s = ttk.Style()
-        s.theme_use("clam")
-        s.configure(".",             font=F_MAIN,  background=t["bg"],   foreground=t["fg"])
-        s.configure("TFrame",        background=t["bg"])
-        s.configure("Card.TFrame",   background=t["card"])
-        s.configure("TLabel",        background=t["bg"],   foreground=t["fg"])
-        s.configure("Card.TLabel",   background=t["card"], foreground=t["fg"])
-        s.configure("TNotebook",     background=t["bg"],   borderwidth=0)
-        s.configure("TNotebook.Tab", font=F_BOLD, padding=[14, 6])
-        s.map("TNotebook.Tab",
-              background=[("selected", C_ACCENT)],
-              foreground=[("selected", "white")])
-        s.configure("Accent.TButton", font=F_BOLD,  foreground="white",
-                    background=C_ACCENT, borderwidth=0, padding=[10, 5])
-        s.map("Accent.TButton", background=[("active", "#1976d2")])
-        s.configure("Small.TButton", font=F_MAIN,  padding=[6, 3],
-                    background=t["btn_bg"], foreground=t["btn_fg"])
-        s.configure("TEntry",        fieldbackground=t["entry_bg"], foreground=t["fg"], padding=4)
-        s.configure("TScrollbar",    background=t["bg"])
-
-    def _apply_theme(self):
-        t = self._t()
-        # Re-apply ttk styles
-        self._setup_styles()
-        # Update root bg
-        self.root.configure(bg=t["bg"])
-        # Run all stored widget update lambdas
-        for fn in self._tw:
-            try: fn(t)
-            except Exception: pass
-        # Specific named widgets
-        self.backup_list.configure(bg=t["listbox_bg"], fg=t["listbox_fg"],
-                                   selectbackground=C_ACCENT, selectforeground="white")
-        self._toggle_btn.configure(text=t["toggle_lbl"])
-
-    def _toggle_theme(self):
-        self._theme_name = "dark" if self._theme_name == "light" else "light"
-        self.cfg["theme"] = self._theme_name
-        self.cfg.save()
-        self._apply_theme()
-
-    def _tw_add(self, widget, **props):
-        """Register a tk widget for theme updates. props maps configure-key -> theme-key."""
-        self._tw.append(lambda t, w=widget, p=props: w.configure(**{k: t[v] for k, v in p.items()}))
-
-    # --- mouse-wheel scrolling ---
-
-    def _bind_scroll(self, region_widget, canvas):
-        """Enable mouse-wheel on canvas whenever cursor is inside region_widget."""
-        fn = lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        region_widget.bind("<Enter>", lambda e: self.root.bind_all("<MouseWheel>", fn))
-        region_widget.bind("<Leave>", lambda e: self.root.unbind_all("<MouseWheel>"))
-        canvas.bind(       "<Enter>", lambda e: self.root.bind_all("<MouseWheel>", fn))
-        canvas.bind(       "<Leave>", lambda e: self.root.unbind_all("<MouseWheel>"))
-
-    # --- header ---
-
-    def _build_header(self):
-        hdr = tk.Frame(self.root, bg=C_ACCENT, height=52)
-        hdr.pack(fill="x", side="top")
-        hdr.pack_propagate(False)
-        tk.Label(hdr, text="  Media Stack Manager", font=F_TITLE,
-                 bg=C_ACCENT, fg="white").pack(side="left", padx=8, pady=12)
-        tk.Label(hdr, text=f"v{VERSION}", font=F_MAIN,
-                 bg=C_ACCENT, fg="#90caf9").pack(side="left")
-        # Dark/Light toggle button (right side of header)
-        self._toggle_btn = tk.Button(
-            hdr, text=self._t()["toggle_lbl"],
-            font=F_MAIN, bg="#0d47a1", fg="white",
-            activebackground="#1565c0", activeforeground="white",
-            relief="flat", padx=10, pady=4, cursor="hand2",
-            command=self._toggle_theme)
-        self._toggle_btn.pack(side="right", padx=12, pady=10)
-
-    def _build_notebook(self):
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 0))
-        self._build_install_tab()
-        self._build_backup_tab()
-        self._build_settings_tab()
-
-    # --- Install tab ---
-
-    def _build_install_tab(self):
-        outer = ttk.Frame(self.nb)
-        self.nb.add(outer, text="  Install  ")
-
-        top = ttk.Frame(outer)
-        top.pack(fill="x", padx=12, pady=8)
-        ttk.Label(top, text="Base folder:").pack(side="left")
-        self.base_var = tk.StringVar(value=self.cfg["base_root"])
-        ttk.Entry(top, textvariable=self.base_var, width=34).pack(side="left", padx=6)
-        ttk.Button(top, text="Browse", style="Small.TButton",
-                   command=self._browse_base).pack(side="left")
-        ttk.Button(top, text="Refresh Status", style="Small.TButton",
-                   command=self._refresh_status).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="Install All", style="Accent.TButton",
-                   command=self._install_all).pack(side="right")
-        ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
-                   command=self._auto_configure).pack(side="right", padx=(0, 6))
-
-        cf = ttk.Frame(outer)
-        cf.pack(fill="both", expand=True, padx=12, pady=4)
-        canvas = tk.Canvas(cf, highlightthickness=0)
-        self._tw_add(canvas, bg="bg")
-        vsb = ttk.Scrollbar(cf, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        self.install_inner = ttk.Frame(canvas)
-        win = canvas.create_window((0, 0), window=self.install_inner, anchor="nw")
-        self.install_inner.bind(
-            "<Configure>",
-            lambda e: (canvas.configure(scrollregion=canvas.bbox("all")),
-                       canvas.itemconfig(win, width=canvas.winfo_width())))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=canvas.winfo_width()))
-        self._bind_scroll(cf, canvas)
-        self.status_vars = {}
-        for app in APPS:
-            self._add_app_row(self.install_inner, app)
-
-    def _add_app_row(self, parent, app):
-        name = app["name"]
-        t    = self._t()
-        row  = tk.Frame(parent, pady=2)
-        self._tw_add(row, bg="card")
-        row.pack(fill="x", padx=2, pady=3)
-        row.columnconfigure(2, weight=1)
-        # Left color bar (app-specific color, not themed)
-        clr = {"Jellyfin":"#00a4dc","Sonarr":"#35c5f4","Radarr":"#ffc230",
-               "Prowlarr":"#ff6a00","Bazarr":"#9b59b6","qBittorrent":"#2ecc71",
-               "Byparr":"#e74c3c","Seer":"#1abc9c"}.get(name, C_ACCENT)
-        tk.Frame(row, bg=clr, width=6).grid(row=0, column=0, rowspan=2, sticky="ns")
-        # App name
-        lbl_name = tk.Label(row, text=name, font=F_BOLD, anchor="w", width=14)
-        self._tw_add(lbl_name, bg="card", fg="fg")
-        lbl_name.grid(row=0, column=1, sticky="w", padx=(8, 4), pady=(6, 0))
-        # App description
-        lbl_desc = tk.Label(row, text=app["desc"], font=F_MAIN, anchor="w")
-        self._tw_add(lbl_desc, bg="card", fg="fg_dim")
-        lbl_desc.grid(row=1, column=1, sticky="w", padx=(8, 4), pady=(0, 6))
-        # Install method badge (keeps own color)
-        method_colors = {"winget": "#1565c0", "docker": "#0288d1", "browser": "#6a1b9a"}
-        method = app.get("install", "")
-        mc     = method_colors.get(method, "#555")
-        badge  = tk.Label(row, text=method.upper(), bg=mc, fg="white",
-                          font=("Segoe UI", 8, "bold"), padx=5, pady=1)
-        badge.grid(row=0, column=2, sticky="w", padx=4, pady=(6, 0))
-        # Status label (starts blank; updated by Refresh Status)
-        sv = tk.StringVar(value="")
-        self.status_vars[name] = sv
-        status_lbl = tk.Label(row, textvariable=sv, font=F_MAIN, anchor="w")
-        self._tw_add(status_lbl, bg="card")
-        status_lbl.grid(row=1, column=2, sticky="w", padx=4, pady=(0, 6))
-        self._status_labels[name] = status_lbl
-        # Install button
-        ttk.Button(row, text="Install", style="Small.TButton",
-                   command=lambda a=app: self._install_one(a)
-                   ).grid(row=0, column=3, rowspan=2, padx=8, pady=6)
-
-    def _refresh_status(self):
-        def run():
-            for app in APPS:
-                name, color_key = app["name"], None
-                label, color_key = self.ops.check_app_status(app)
-                self.root.after(0, lambda n=name, lb=label, ck=color_key:
-                               self._set_status(n, lb, ck))
-        self._run_bg(run)
-
-    def _set_status(self, name, label, color_key):
-        t = self._t()
-        if name in self.status_vars:
-            self.status_vars[name].set(label)
-        if name in self._status_labels:
-            color = t.get(color_key, t["fg_dim"])
-            self._status_labels[name].configure(fg=color)
-
-    def _browse_base(self):
-        d = filedialog.askdirectory(initialdir=self.base_var.get())
-        if d:
-            self.base_var.set(d)
-            self.cfg["base_root"] = d
-            self.cfg.save()
-
-    def _install_one(self, app):
-        self._run_bg(lambda: self.ops.install_app(app))
-
-    def _install_all(self):
-        self.cfg["base_root"] = self.base_var.get()
-        self.cfg.save()
-        self._run_bg(lambda: [self.ops.install_app(a) for a in APPS])
-
-    def _auto_configure(self):
-        if not messagebox.askyesno(
-                "Auto-Configure",
-                "This will configure all apps automatically:\n\n"
-                "  - qBittorrent: WebUI port, download path\n"
-                "  - Sonarr/Radarr: root folder, qBittorrent client\n"
-                "  - Prowlarr: link Sonarr + Radarr\n"
-                "  - Bazarr: write Sonarr + Radarr connections\n"
-                "  - Jellyfin: add Movies + TV libraries (needs API key in Settings)\n\n"
-                "All apps must already be installed and running.\n"
-                "Existing settings will NOT be overwritten. Continue?"):
-            return
-        self._run_bg(self.ops.configure_all)
-
-    # --- Backup / Restore tab ---
-
-    def _build_backup_tab(self):
-        outer = ttk.Frame(self.nb)
-        self.nb.add(outer, text="  Backup & Restore  ")
-        outer.columnconfigure(0, weight=1)
-        outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(0, weight=1)
-
-        # Left: Backup panel
-        lf = tk.LabelFrame(outer, text=" Backup ", font=F_BOLD, padx=10, pady=10)
-        self._tw_add(lf, bg="lf_bg", fg="lf_fg")
-        lf.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
-        lf.columnconfigure(0, weight=1)
-
-        desc = tk.Label(lf, text="Creates a timestamped snapshot of every app\n"
-                            "using each app's built-in backup where available.",
-                        font=F_MAIN, justify="left", anchor="w")
-        self._tw_add(desc, bg="lf_bg", fg="fg")
-        desc.pack(anchor="w")
-
-        ttk.Button(lf, text="Back Up All Now", style="Accent.TButton",
-                   command=self._do_backup).pack(anchor="w", pady=(12, 4))
-
-        sep_lbl = tk.Label(lf, text="Individual apps:", font=F_MAIN, anchor="w")
-        self._tw_add(sep_lbl, bg="lf_bg", fg="fg_dim")
-        sep_lbl.pack(anchor="w", pady=(10, 2))
-
-        for app in APPS:
-            if app.get("backup") is None: continue
-            ttk.Button(lf, text=f"  Back up {app['name']}",
-                       style="Small.TButton",
-                       command=lambda a=app: self._backup_one(a)).pack(anchor="w", pady=1)
-
-        # Right: Restore panel
-        rf = tk.LabelFrame(outer, text=" Restore ", font=F_BOLD, padx=10, pady=10)
-        self._tw_add(rf, bg="lf_bg", fg="lf_fg")
-        rf.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
-        rf.columnconfigure(0, weight=1)
-        rf.rowconfigure(1, weight=1)
-
-        hdr_lbl = tk.Label(rf, text="Select a backup set:", font=F_MAIN, anchor="w")
-        self._tw_add(hdr_lbl, bg="lf_bg", fg="fg")
-        hdr_lbl.grid(row=0, column=0, sticky="w")
-
-        self.backup_list = tk.Listbox(rf, font=F_MONO, height=12,
-                                      selectmode="single",
-                                      bg="white", fg="#111",
-                                      selectbackground=C_ACCENT, selectforeground="white")
-        self.backup_list.grid(row=1, column=0, sticky="nsew", pady=6)
-        sb = ttk.Scrollbar(rf, command=self.backup_list.yview)
-        sb.grid(row=1, column=1, sticky="ns", pady=6)
-        self.backup_list.configure(yscrollcommand=sb.set)
-        self.backup_list.bind("<MouseWheel>",
-            lambda e: self.backup_list.yview_scroll(int(-1*(e.delta/120)), "units"))
-
-        btn_row = ttk.Frame(rf)
-        btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(btn_row, text="Refresh", style="Small.TButton",
-                   command=self._refresh_backup_list).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_row, text="Restore Selected", style="Accent.TButton",
-                   command=self._do_restore).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_row, text="Delete Selected", style="Small.TButton",
-                   command=self._delete_backup).pack(side="left")
-        self._refresh_backup_list()
-
-    def _refresh_backup_list(self):
-        self.backup_list.delete(0, "end")
-        self._backup_sets = self.ops.list_backups()
-        for s in self._backup_sets:
-            label = f"{s['timestamp']}  [{s['count']} archives | {s['machine']}]"
-            self.backup_list.insert("end", label)
-
-    def _do_backup(self):
-        def after(results):
-            self.root.after(0, self._refresh_backup_list)
-        self._run_bg(lambda: self.ops.backup_all(callback=after))
-
-    def _backup_one(self, app):
-        ts     = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        bk_set = Path(self.cfg["backup_root"]) / f"{ts}_{app['name']}"
-        bk_set.mkdir(parents=True, exist_ok=True)
-        def run():
-            method = app.get("backup")
-            cfg_dir = self.ops.resolve_path(app.get("config_paths", []))
-            if method == "arr_api" and cfg_dir:
-                self.ops._arr_api_backup(app, cfg_dir, bk_set)
-            elif method == "bazarr_api" and cfg_dir:
-                self.ops._bazarr_file_backup(app, cfg_dir, bk_set)
-            elif method == "jellyfin_api" and cfg_dir:
-                self.ops._jellyfin_api_backup(app, cfg_dir, bk_set)
-            elif method == "file_copy":
-                src = Path(self.cfg["base_root"]) / app["volume_subpath"] \
-                      if app.get("container") else cfg_dir
-                if src and src.exists():
-                    self.ops.stop_app(app)
-                    self.ops._file_copy_backup(app, src, bk_set)
-                    self.ops.start_app(app)
-            self.root.after(0, self._refresh_backup_list)
-        self._run_bg(run)
-
-    def _do_restore(self):
-        sel = self.backup_list.curselection()
-        if not sel:
-            messagebox.showwarning("Restore", "Select a backup set from the list first.")
-            return
-        bk = self._backup_sets[sel[0]]
-        if not messagebox.askyesno("Confirm Restore",
-                f"Restore from:\n{bk['timestamp']}\n\n"
-                "Existing configs will be renamed to .bak_TIMESTAMP. Continue?"):
-            return
-        self._run_bg(lambda: self.ops.restore_backup(bk["path"]))
-
-    def _delete_backup(self):
-        sel = self.backup_list.curselection()
-        if not sel:
-            messagebox.showwarning("Delete", "Select a backup set to delete.")
-            return
-        bk = self._backup_sets[sel[0]]
-        if not messagebox.askyesno("Confirm Delete",
-                f"Permanently delete backup:\n{bk['timestamp']}\n\n"
-                "This cannot be undone."):
-            return
-        try:
-            shutil.rmtree(bk["path"])
-            self.log(f"Deleted backup: {bk['timestamp']}", "warn")
-        except Exception as e:
-            self.log(f"Delete failed: {e}", "err")
-        self._refresh_backup_list()
-
-    # --- Settings tab ---
-
-    def _build_settings_tab(self):
-        outer  = ttk.Frame(self.nb)
-        self.nb.add(outer, text="  Settings  ")
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        self._tw_add(canvas, bg="bg")
-        vsb    = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = ttk.Frame(canvas)
-        win   = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=canvas.winfo_width()))
-        self._bind_scroll(outer, canvas)
-        self._setting_vars = {}
-
-        row_idx = [0]
-
-        def section(text):
-            lbl = ttk.Label(inner, text=text, font=F_BOLD)
-            lbl.grid(row=row_idx[0], column=0, columnspan=3, sticky="w", padx=14, pady=(14, 2))
-            # Force section label to use section_fg color via _tw
-            self._tw.append(lambda t, w=lbl: w.configure(foreground=t["section_fg"]))
-            row_idx[0] += 1
-
-        def field(label, key, is_dir=False):
-            r = row_idx[0]
-            ttk.Label(inner, text=label).grid(row=r, column=0, sticky="w", padx=(14, 4), pady=3)
-            var = tk.StringVar(value=self.cfg[key])
-            self._setting_vars[key] = var
-            ttk.Entry(inner, textvariable=var, width=44).grid(row=r, column=1, sticky="ew", padx=4)
-            if is_dir:
-                ttk.Button(inner, text="...", width=3, style="Small.TButton",
-                           command=lambda v=var: v.set(filedialog.askdirectory() or v.get())
-                           ).grid(row=r, column=2, padx=(0, 14))
-            row_idx[0] += 1
-
-        section("Folders")
-        field("Base folder",      "base_root",      is_dir=True)
-        field("Media folder",     "media_root",     is_dir=True)
-        field("Downloads folder", "downloads_root", is_dir=True)
-        field("Backup folder",    "backup_root",    is_dir=True)
-
-        section("Ports")
-        field("Jellyfin port",    "jellyfin_port")
-        field("Sonarr port",      "sonarr_port")
-        field("Radarr port",      "radarr_port")
-        field("Bazarr port",      "bazarr_port")
-        field("Prowlarr port",    "prowlarr_port")
-        field("qBittorrent port", "qb_port")
-        field("Byparr port",      "byparr_port")
-        field("Seer port",        "seer_port")
-
-        section("Docker Images")
-        field("Byparr image", "byparr_image")
-        field("Seer image",   "seer_image")
-
-        section("API Keys")
-        field("Jellyfin API key", "jellyfin_api_key")
-        hint = ttk.Label(inner, text="Create in Jellyfin Dashboard -> Advanced -> API Keys")
-        self._tw.append(lambda t, w=hint: w.configure(foreground=t["fg_dim"]))
-        hint.grid(row=row_idx[0], column=1, sticky="w", pady=(0, 6))
-        row_idx[0] += 1
-
-        inner.columnconfigure(1, weight=1)
-        ttk.Button(inner, text="Save Settings", style="Accent.TButton",
-                   command=self._save_settings).grid(
-            row=row_idx[0], column=0, columnspan=3, pady=14, padx=14, sticky="w")
-
-    def _save_settings(self):
-        for key, var in self._setting_vars.items():
-            self.cfg[key] = var.get()
-        self.cfg.save()
-        self.base_var.set(self.cfg["base_root"])
-        self.log("Settings saved.", "ok")
-
-    # --- Log ---
-
-    def _build_log(self):
-        frame = ttk.Frame(self.root)
-        frame.pack(fill="x", padx=10, pady=(4, 0))
-        hdr = tk.Frame(frame, bg=C_LOG_BG)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text=" Output Log", bg=C_LOG_BG, fg="#888",
-                 font=F_MONO).pack(side="left", padx=6, pady=2)
-        tk.Button(hdr, text="Clear", bg=C_LOG_BG, fg="#888", font=F_MONO,
-                  bd=0, cursor="hand2",
-                  command=self._clear_log).pack(side="right", padx=6)
-        self.log_txt = scrolledtext.ScrolledText(
-            frame, height=10, bg=C_LOG_BG, fg=C_LOG_FG, font=F_MONO,
-            insertbackground=C_LOG_FG, wrap="word", state="disabled",
-            relief="flat", borderwidth=0)
-        self.log_txt.pack(fill="x")
-        self.log_txt.tag_configure("ok",   foreground=C_LOG_OK)
-        self.log_txt.tag_configure("warn", foreground=C_LOG_WRN)
-        self.log_txt.tag_configure("err",  foreground=C_LOG_ERR)
-        self.log_txt.tag_configure("bold", foreground="#ffffff", font=("Consolas", 9, "bold"))
-        self.log_txt.tag_configure("info", foreground=C_LOG_FG)
-
-    def _build_statusbar(self):
-        self.status_var = tk.StringVar(value="Ready")
-        bar = tk.Frame(self.root, bg=C_ACCENT, height=22)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-        tk.Label(bar, textvariable=self.status_var, bg=C_ACCENT, fg="white",
-                 font=F_MONO, anchor="w").pack(side="left", padx=8)
-
-    # --- Queue / threading ---
-
-    def log(self, msg, tag="info"):
-        self._enqueue_log(msg, tag)
-
-    def _enqueue_log(self, msg, tag="info"):
-        self.q.put((msg, tag))
-
-    def _check_queue(self):
-        try:
-            while True:
-                msg, tag = self.q.get_nowait()
-                self.log_txt.configure(state="normal")
-                self.log_txt.insert("end", msg + "\n", tag)
-                self.log_txt.see("end")
-                self.log_txt.configure(state="disabled")
-                self.status_var.set(msg[:90] if msg.strip() else "Ready")
-        except queue.Empty:
-            pass
-        self.root.after(50, self._check_queue)
-
-    def _clear_log(self):
-        self.log_txt.configure(state="normal")
-        self.log_txt.delete("1.0", "end")
-        self.log_txt.configure(state="disabled")
-
-    def _run_bg(self, fn):
-        threading.Thread(target=fn, daemon=True).start()
-
-    def run(self):
-        self.root.mainloop()
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    if sys.platform == "win32" and not ctypes.windll.shell32.IsUserAnAdmin():
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(f'"{a}"' for a in sys.argv), None, 1)
-        sys.exit(0)
-    App().run()
