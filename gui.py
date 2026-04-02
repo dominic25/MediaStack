@@ -152,6 +152,10 @@ class App:
                    command=self._install_all)
         btn.pack(side="right")
         self._action_buttons.append(btn)
+        btn = ttk.Button(top, text="Uninstall All", style="Accent.TButton",
+                   command=self._uninstall_all)
+        btn.pack(side="right", padx=(0, 6))
+        self._action_buttons.append(btn)
         btn = ttk.Button(top, text="Auto-Configure", style="Accent.TButton",
                    command=self._auto_configure)
         btn.pack(side="right", padx=(0, 6))
@@ -209,6 +213,9 @@ class App:
         ttk.Button(row, text="Install", style="Small.TButton",
                    command=lambda a=app: self._install_one(a)
                    ).grid(row=0, column=3, rowspan=2, padx=8, pady=6)
+        ttk.Button(row, text="Uninstall", style="Small.TButton",
+                   command=lambda a=app: self._uninstall_one(a)
+                   ).grid(row=0, column=4, rowspan=2, padx=6, pady=6)
 
     def _refresh_status(self):
         def run():
@@ -237,10 +244,29 @@ class App:
     def _install_one(self, app):
         self._run_bg(lambda: self.ops.install_app(app))
 
+    def _uninstall_one(self, app):
+        name = app["name"]
+        if not messagebox.askyesno("Uninstall", f"Uninstall {name}?"):
+            return
+        remove_data = messagebox.askyesno(
+            "Remove data/config?",
+            "Also remove data/config folders?\n\n"
+            "This is more destructive and may remove your settings and databases.")
+        self._run_bg(lambda: self.ops.uninstall_app(app, remove_data=remove_data))
+
     def _install_all(self):
         self.cfg["base_root"] = self.base_var.get()
         self.cfg.save()
         self._run_bg(lambda: [self.ops.install_app(a) for a in APPS])
+
+    def _uninstall_all(self):
+        if not messagebox.askyesno("Uninstall All", "Uninstall ALL apps?"):
+            return
+        remove_data = messagebox.askyesno(
+            "Remove data/config?",
+            "Also remove data/config folders for ALL apps?\n\n"
+            "This is more destructive and may remove your settings and databases.")
+        self._run_bg(lambda: [self.ops.uninstall_app(a, remove_data=remove_data) for a in APPS])
 
     def _auto_configure(self):
         if not messagebox.askyesno(

@@ -50,6 +50,9 @@ class Ops:
         proc.wait()
         return proc.returncode
 
+    def _has_cmd(self, cmd):
+        return shutil.which(cmd) is not None
+
     def http_post(self, url, headers, body=None, timeout=15):
         data = body.encode() if isinstance(body, str) else body
         req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -127,18 +130,129 @@ class Ops:
         method = app.get("install")
         self.log(f"=== Installing {name} ===", "bold")
         if method == "winget":
+            if not self._has_cmd("winget"):
+                self.log("  winget not found on PATH.", "warn")
+                if app.get("url"):
+                    self.log(f"  Opening browser to {app['url']}", "info")
+                    os.startfile(app["url"])
+                    self.log("  Complete the installer, then click Refresh Status.", "warn")
+                return
+
+            winget_id = app.get("winget_id")
+            if not winget_id:
+                self.log(f"  No winget id for {name}.", "warn")
+                return
+
             rc = self.run_stream([
-                "winget", "install", "--id", app["winget_id"], "-e",
+                "winget", "install", "--id", winget_id, "-e",
                 "--accept-package-agreements", "--accept-source-agreements"
             ])
-            if rc == 0: self.log(f"  {name} installed.", "ok")
-            else:       self.log(f"  winget returned {rc} for {name}.", "warn")
+            if rc == 0:
+                self.log(f"  {name} installed.", "ok")
+            else:
+                self.log(f"  winget returned {rc} for {name}.", "warn")
+                if app.get("url"):
+                    self.log(f"  Opening browser to {app['url']} (fallback)", "info")
+                    os.startfile(app["url"])
+                    self.log("  Complete the installer, then click Refresh Status.", "warn")
         elif method == "browser":
             self.log(f"  Opening browser to {app['url']}", "info")
             os.startfile(app["url"])
             self.log("  Complete the installer, then click Refresh Status.", "warn")
         elif method == "docker":
             self._docker_install(app)
+
+    # --- uninstall ---
+
+    def _safe_rmtree(self, path: Path, allowed_roots):
+        """
+        Remove a directory tree if it is under an allowed root.
+        allowed_roots: iterable[Path]
+        """
+        try:
+            path = path.resolve()
+        except Exception:
+            path = Path(str(path))
+
+        for root in allowed_roots:
+            try:
+                root = root.resolve()
+            except Exception:
+                root = Path(str(root))
+            try:
+                if path == root or root in path.parents:
+                    shutil.rmtree(path, ignore_errors=True)
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def uninstall_app(self, app, remove_data=False):
+        name   = app["name"]
+        method = app.get("install")
+        self.log(f"=== Uninstalling {name} ===", "bold")
+
+        # Stop first (best-effort)
+        try:
+            self.stop_app(app)
+        except Exception:
+            pass
+
+        if method == "winget":
+            winget_id = app.get("winget_id")
+            if not winget_id:
+                self.log(f"  No winget id for {name}.", "warn")
+            else:
+                rc = self.run_stream(["winget", "uninstall", "--id", winget_id, "-e"])
+                if rc == 0: self.log(f"  {name} uninstalled.", "ok")
+                else:       self.log(f"  winget returned {rc} for {name}.", "warn")
+
+        elif method == "docker":
+            container = app.get("container")
+            if container:
+                self.log(f"  Removing container: {container}", "warn")
+                self.run(["docker", "stop", container])
+                self.run(["docker", "rm", "-f", container])
+            else:
+                self.log("  No container specified.", "warn")
+
+            if remove_data:
+                base = Path(self.cfg["base_root"])
+                vol_sub = app.get("volume_subpath")
+                vol_path = (base / vol_sub) if vol_sub else (base / name)
+                if vol_path.exists():
+                    ok = self._safe_rmtree(vol_path, allowed_roots=[base])
+                    if ok: self.log(f"  Removed data folder: {vol_path}", "ok")
+                    else:  self.log(f"  Refused to remove folder (safety): {vol_path}", "err")
+                else:
+                    self.log(f"  Data folder not found: {vol_path}", "warn")
+
+        elif method == "browser":
+            self.log("  This app was installed manually via browser.", "warn")
+            self.log("  Please uninstall it via Windows Settings -> Apps.", "warn")
+
+        else:
+            self.log(f"  Unknown install method: {method}", "warn")
+
+        if remove_data:
+            # Remove config folders (best-effort, with safety)
+            cfgs = app.get("config_paths", [])
+            if cfgs:
+                allowed = []
+                base = Path(self.cfg["base_root"])
+                allowed.append(base)
+                for env_key in ("APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "USERPROFILE"):
+                    v = os.environ.get(env_key)
+                    if v:
+                        allowed.append(Path(v))
+                allowed.append(Path(r"C:\ProgramData"))
+
+                for c in cfgs:
+                    p = Path(os.path.expandvars(c))
+                    if p.exists():
+                        ok = self._safe_rmtree(p, allowed_roots=allowed)
+                        if ok: self.log(f"  Removed config: {p}", "ok")
+                        else:  self.log(f"  Refused to remove config (safety): {p}", "err")
 
     def _docker_install(self, app):
         name      = app["name"]

@@ -62,7 +62,8 @@ THEMES = {
 APPS = [
     {
         "name": "Jellyfin", "desc": "Media server",
-        "install": "browser", "url": "https://jellyfin.org/downloads/windows/server",
+        "install": "winget", "winget_id": "Jellyfin.Server",
+        "url": "https://jellyfin.org/downloads/windows/server",
         "service": "Jellyfin", "process": "jellyfin",
         "exe_candidates": ["jellyfin.exe", "JellyfinTray.exe"],
         "common_dirs": [r"C:\Program Files\Jellyfin\Server"],
