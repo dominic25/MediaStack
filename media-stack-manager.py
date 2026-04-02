@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-media-stack-manager.py
+media-stack-manager.py - Media Stack Manager
 All-in-one GUI: install, backup, and restore your self-hosted media stack.
 Requirements: Python 3.8+  |  Windows 10/11  |  No pip packages required.
 """
@@ -11,32 +11,63 @@ import tempfile, time, sys, ctypes, configparser
 import urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-VERSION   = "1.0"
+
+VERSION   = "1.1"
 CONF_FILE = Path(__file__).with_name("media-stack-config.json")
 
-C_BG      = "#f5f5f5"
-C_CARD    = "#ffffff"
-C_ACCENT  = "#1565c0"
-C_ALT     = "#e3f2fd"
-C_SUCCESS = "#2e7d32"
-C_WARN    = "#e65100"
-C_ERR     = "#c62828"
-C_LOG_BG  = "#1e1e1e"
-C_LOG_FG  = "#d4d4d4"
-C_LOG_OK  = "#4ec9b0"
-C_LOG_WRN = "#ce9178"
-C_LOG_ERR = "#f48771"
-F_MAIN    = ("Segoe UI", 10)
-F_BOLD    = ("Segoe UI", 10, "bold")
-F_TITLE   = ("Segoe UI", 13, "bold")
-F_MONO    = ("Consolas", 9)
+# Accent and log colors are fixed across themes
+C_ACCENT   = "#1565c0"
+C_LOG_BG   = "#1e1e1e"
+C_LOG_FG   = "#d4d4d4"
+C_LOG_OK   = "#4ec9b0"
+C_LOG_WRN  = "#ce9178"
+C_LOG_ERR  = "#f48771"
+F_MAIN     = ("Segoe UI", 10)
+F_BOLD     = ("Segoe UI", 10, "bold")
+F_TITLE    = ("Segoe UI", 13, "bold")
+F_MONO     = ("Consolas", 9)
 
-# ---------------------------------------------------------------------------
-# App definitions
-# ---------------------------------------------------------------------------
+THEMES = {
+    "light": {
+        "bg":         "#f5f5f5",
+        "card":       "#ffffff",
+        "fg":         "#111111",
+        "fg_dim":     "#555555",
+        "entry_bg":   "#ffffff",
+        "listbox_bg": "#ffffff",
+        "listbox_fg": "#111111",
+        "section_fg": "#1565c0",
+        "btn_bg":     "#e0e0e0",
+        "btn_fg":     "#111111",
+        "lf_bg":      "#f5f5f5",
+        "lf_fg":      "#333333",
+        "toggle_lbl": "Dark mode",
+        "status_ok":  "#2e7d32",
+        "status_warn":"#b71c1c",
+        "status_info":"#1565c0",
+        "status_dim": "#888888",
+    },
+    "dark": {
+        "bg":         "#1e1e2e",
+        "card":       "#2a2a3e",
+        "fg":         "#cdd6f4",
+        "fg_dim":     "#a6adc8",
+        "entry_bg":   "#313244",
+        "listbox_bg": "#2a2a3e",
+        "listbox_fg": "#cdd6f4",
+        "section_fg": "#89b4fa",
+        "btn_bg":     "#45475a",
+        "btn_fg":     "#cdd6f4",
+        "lf_bg":      "#1e1e2e",
+        "lf_fg":      "#a6adc8",
+        "toggle_lbl": "Light mode",
+        "status_ok":  "#a6e3a1",
+        "status_warn":"#f38ba8",
+        "status_info":"#89b4fa",
+        "status_dim": "#6c7086",
+    },
+}
+
 APPS = [
     {
         "name": "Jellyfin", "desc": "Media server",
@@ -124,11 +155,9 @@ DEFAULTS = {
     "jellyfin_api_key": "",
     "byparr_image":    "thetadev256/byparr:latest",
     "seer_image":      "seerr/seerr:latest",
+    "theme":           "light",
 }
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 class Config:
     def __init__(self):
         self.data = dict(DEFAULTS)
@@ -150,20 +179,15 @@ class Config:
     def get(self, k, d=""): return self.data.get(k, d)
 
 # ---------------------------------------------------------------------------
-# Backend operations
+# Backend (Ops)
 # ---------------------------------------------------------------------------
 class Ops:
-    """All install / backup / restore logic. Methods run on background threads.
-    Use self.log() to emit messages - never call tkinter from here."""
-
     def __init__(self, config: Config, log_fn):
         self.cfg    = config
         self.log_fn = log_fn
 
     def log(self, msg, tag="info"):
         self.log_fn(msg, tag)
-
-    # ---- helpers ----
 
     def resolve_path(self, candidates):
         for c in candidates:
@@ -173,14 +197,11 @@ class Ops:
         return None
 
     def find_exe(self, app):
-        """Find app exe from service registry or common dirs."""
-        # try common install dirs
         for d in app.get("common_dirs", []):
             for exe in app.get("exe_candidates", []):
                 p = Path(d) / exe
                 if p.exists():
                     return p
-        # try Program Files variants
         for pf in [r"C:\Program Files", r"C:\Program Files (x86)"]:
             for exe in app.get("exe_candidates", []):
                 p = Path(pf) / app["name"] / exe
@@ -192,7 +213,6 @@ class Ops:
         return subprocess.run(args, capture_output=True, text=True, **kwargs)
 
     def run_stream(self, args, **kwargs):
-        """Run a command and stream stdout line-by-line to log."""
         proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, **kwargs)
         for line in proc.stdout:
@@ -211,10 +231,9 @@ class Ops:
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
 
-    # ---- stop / start ----
+    # --- stop / start ---
 
     def stop_app(self, app):
-        name = app["name"]
         if app.get("container"):
             self.log(f"  Stopping container: {app['container']}", "warn")
             self.run(["docker", "stop", app["container"]])
@@ -237,7 +256,6 @@ class Ops:
                 time.sleep(2)
 
     def start_app(self, app):
-        name = app["name"]
         if app.get("container"):
             self.log(f"  Starting container: {app['container']}", "ok")
             self.run(["docker", "start", app["container"]])
@@ -249,18 +267,33 @@ class Ops:
                 self.log(f"  Starting service: {svc}", "ok")
                 self.run(["net", "start", svc])
                 return
-        # No service - find and launch exe
         exe = self.find_exe(app)
         if exe:
             self.log(f"  Launching exe: {exe}", "ok")
             subprocess.Popen([str(exe)], cwd=str(exe.parent))
         else:
-            self.log(f"  Could not find {name} exe to launch - relaunch manually.", "warn")
+            self.log(f"  Could not find {app['name']} exe - relaunch manually.", "warn")
 
-    # ---- install ----
+    def check_app_status(self, app):
+        """Returns (label, color_key)."""
+        if app.get("container"):
+            r = self.run(["docker", "ps", "-q", "--filter", f"name=^/{app['container']}$"])
+            if r.stdout.strip(): return ("Running", "status_ok")
+            r2 = self.run(["docker", "ps", "-a", "-q", "--filter", f"name=^/{app['container']}$"])
+            return ("Stopped", "status_warn") if r2.stdout.strip() else ("Not installed", "status_dim")
+        svc = app.get("service")
+        if svc:
+            r = self.run(["sc", "query", svc])
+            if "RUNNING" in r.stdout: return ("Running", "status_ok")
+            if "STOPPED" in r.stdout: return ("Stopped", "status_warn")
+        if self.find_exe(app):
+            return ("Installed", "status_info")
+        return ("Not installed", "status_dim")
+
+    # --- install ---
 
     def install_app(self, app):
-        name = app["name"]
+        name   = app["name"]
         method = app.get("install")
         self.log(f"=== Installing {name} ===", "bold")
         if method == "winget":
@@ -268,10 +301,8 @@ class Ops:
                 "winget", "install", "--id", app["winget_id"], "-e",
                 "--accept-package-agreements", "--accept-source-agreements"
             ])
-            if rc == 0:
-                self.log(f"  {name} installed.", "ok")
-            else:
-                self.log(f"  winget returned {rc} for {name}.", "warn")
+            if rc == 0: self.log(f"  {name} installed.", "ok")
+            else:       self.log(f"  winget returned {rc} for {name}.", "warn")
         elif method == "browser":
             self.log(f"  Opening browser to {app['url']}", "info")
             os.startfile(app["url"])
@@ -288,80 +319,58 @@ class Ops:
         vol_sub   = app.get("volume_subpath")
         vol_path  = base / vol_sub if vol_sub else base / name
         vol_path.mkdir(parents=True, exist_ok=True)
-
-        # 1. Remove the target container if it already exists (any state)
         r = self.run(["docker", "ps", "-a", "-q", "--filter", f"name=^/{container}$"])
         if r.stdout.strip():
             self.log(f"  Removing existing '{container}' container ...", "warn")
             self.run(["docker", "stop", container])
             self.run(["docker", "rm",   container])
-
-        # 2. Kill ANY container that is already bound to the host port.
-        #    This catches old containers with different names (e.g. 'jellyseerr' -> 'seer').
         r = self.run(["docker", "ps", "-q", "--filter", f"publish={port_host}"])
         for cid in r.stdout.strip().splitlines():
             cid = cid.strip()
-            if not cid:
-                continue
-            # Get its name for a helpful log message
-            nr = self.run(["docker", "inspect", "--format", "{{.Name}}", cid])
+            if not cid: continue
+            nr    = self.run(["docker", "inspect", "--format", "{{.Name}}", cid])
             cname = nr.stdout.strip().lstrip("/")
-            self.log(f"  Port {port_host} in use by container '{cname}' - stopping it ...", "warn")
+            self.log(f"  Port {port_host} already used by '{cname}' - removing it ...", "warn")
             self.run(["docker", "stop", cid])
             self.run(["docker", "rm",   cid])
-
         self.log(f"  Pulling {image} ...")
         self.run_stream(["docker", "pull", image])
-
-        # Determine internal container port
         inner = "8191" if name == "Byparr" else port_host
-
-        # Build run command
-        # Seer (seerr/seerr) requires --init for correct signal handling
         cmd = ["docker", "run", "-d", "--name", container, "--restart", "unless-stopped"]
-        if name == "Seer":
-            cmd += ["--init"]
+        if name == "Seer": cmd += ["--init"]
         cmd += ["-p", f"{port_host}:{inner}", "-v", f"{vol_path}:/app/config", image]
-
         r = self.run(cmd)
-        if r.returncode == 0:
-            self.log(f"  {name} container started on port {port_host}.", "ok")
-        else:
-            self.log(f"  docker run failed: {r.stderr.strip()}", "err")
+        if r.returncode == 0: self.log(f"  {name} started on port {port_host}.", "ok")
+        else:                 self.log(f"  docker run failed: {r.stderr.strip()}", "err")
 
-    # ---- backup helpers ----
+    # --- backup helpers ---
 
     def _arr_api_backup(self, app, config_dir, backup_set):
         port    = self.cfg[app["port_key"]]
         version = app["arr_version"]
         name    = app["name"]
         try:
-            # Read api key from config.xml
             import xml.etree.ElementTree as ET
             xml_path = config_dir / "config.xml"
             if not xml_path.exists():
                 self.log(f"  config.xml not found in {config_dir}", "err")
                 return False
-            root = ET.parse(xml_path).getroot()
+            root    = ET.parse(xml_path).getroot()
             api_key = root.findtext("ApiKey")
             port    = root.findtext("Port") or port
             base    = f"http://localhost:{port}/api/{version}"
             hdrs    = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-            # Trigger backup
             self.log(f"  Triggering {name} API backup on port {port} ...")
             result = self.http_post(f"{base}/command", hdrs, '{"name":"Backup"}')
             cmd_id = result["id"]
-            # Poll for completion
             deadline = time.time() + 120
             while time.time() < deadline:
                 time.sleep(3)
                 status = self.http_get(f"{base}/command/{cmd_id}", hdrs)
-                if status["status"] in ("completed", "failed"):
-                    break
+                if status["status"] in ("completed", "failed"): break
             if status["status"] != "completed":
-                self.log(f"  {name} backup command status: {status['status']}", "err")
+                self.log(f"  {name} backup status: {status['status']}", "err")
                 return False
-            # Copy newest zip from app Backups folder
             app_bk_dir = config_dir / "Backups"
             zips = sorted(app_bk_dir.glob("**/*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
             if not zips:
@@ -379,28 +388,19 @@ class Ops:
     def _bazarr_file_backup(self, app, config_dir, backup_set):
         config_dir = Path(config_dir)
         dest = Path(backup_set) / "Bazarr.zip"
-        
-        # Based on your directory listing: ['config', 'db'] are the essentials
         items_to_backup = ["config", "db"]
-        
         try:
-            self.log(f"  Starting file-based backup for Bazarr...")
-            import zipfile
-            import tempfile
-
-            with zipfile.ZipFile(dest, 'w', zipfile.ZIP_DEFLATED) as zf:
+            self.log("  Starting file-based backup for Bazarr...")
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
                 for folder_name in items_to_backup:
                     source_path = config_dir / folder_name
-                    
                     if not source_path.exists():
                         self.log(f"    Warning: {folder_name} not found, skipping.", "warn")
                         continue
-                    
                     self.log(f"    Archiving {folder_name}...")
-                    for file in source_path.rglob('*'):
+                    for file in source_path.rglob("*"):
                         if file.is_file():
                             try:
-                                # Special handling for the database to avoid 'Locked' errors
                                 if file.suffix == ".db":
                                     with tempfile.TemporaryDirectory() as tmpdir:
                                         tmp_file = Path(tmpdir) / file.name
@@ -410,14 +410,11 @@ class Ops:
                                     zf.write(file, file.relative_to(config_dir))
                             except Exception as fe:
                                 self.log(f"    Could not backup {file.name}: {fe}", "warn")
-
             if dest.exists() and dest.stat().st_size > 0:
                 mb = round(dest.stat().st_size / 1048576, 2)
                 self.log(f"  OK - Created Bazarr.zip ({mb} MB)", "ok")
                 return True
-            
             return False
-
         except Exception as e:
             self.log(f"  Bazarr file backup failed: {e}", "err")
             return False
@@ -430,48 +427,26 @@ class Ops:
             return False
         try:
             self.log(f"  Triggering Jellyfin backup via API on port {port} ...")
-            
-            hdrs  = {
-                "X-MediaBrowser-Token": api_key, 
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "Database": True,
-                "Metadata": True,
-                "Subtitles": True,
-                "Trickplay": False  # Usually kept False to keep backup size small
-            }
-
-            result = self.http_post(f"http://localhost:{port}/Backup/Create", hdrs, json.dumps(payload), timeout=300)
-            
-            # Find newest backup zip
-            # Note: Ensure config_dir points to the actual Jellyfin config root
+            hdrs = {"X-MediaBrowser-Token": api_key, "Content-Type": "application/json"}
+            payload = {"Database": True, "Metadata": True, "Subtitles": True, "Trickplay": False}
+            self.http_post(f"http://localhost:{port}/Backup/Create", hdrs, json.dumps(payload), timeout=300)
             bk_dir = Path(config_dir) / "data" / "backups"
-            zips = sorted(bk_dir.glob("**/*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-            
+            zips   = sorted(bk_dir.glob("**/*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
             if not zips:
-                self.log("  No backup zip produced in 'backups' folder. Falling back to file copy.", "warn")
+                self.log("  No backup zip found. Falling back to file copy.", "warn")
                 return False
-                
             dest = Path(backup_set) / "Jellyfin.zip"
             shutil.copy2(zips[0], dest)
             mb = round(dest.stat().st_size / 1048576, 2)
             self.log(f"  OK - {zips[0].name} -> Jellyfin.zip ({mb} MB)", "ok")
             return True
-            
         except Exception as e:
-            if "timeout" in str(e).lower():
-                self.log("  API request timed out")
-            else:
-                self.log(f"  Jellyfin API backup failed: {e} - falling back to file copy.", "warn")
+            self.log(f"  Jellyfin API backup failed: {e} - falling back to file copy.", "warn")
             return False
 
-
     def _file_copy_backup(self, app, src_dir, backup_set):
-        """Robust per-file copy to temp dir, then zip. Skips locked files."""
-        name = app["name"]
-        tmp  = Path(tempfile.mkdtemp(prefix=f"mstack_{name}_"))
+        name    = app["name"]
+        tmp     = Path(tempfile.mkdtemp(prefix=f"mstack_{name}_"))
         skipped = []
         try:
             for item in src_dir.rglob("*"):
@@ -486,10 +461,8 @@ class Ops:
                             shutil.copy2(item, target)
                             break
                         except (PermissionError, OSError):
-                            if attempt < 2:
-                                time.sleep(1)
-                            else:
-                                skipped.append(str(rel))
+                            if attempt < 2: time.sleep(1)
+                            else: skipped.append(str(rel))
             if skipped:
                 self.log(f"  Skipped {len(skipped)} locked file(s): {skipped[:3]}", "warn")
             dest  = Path(backup_set) / f"{name}.zip"
@@ -499,8 +472,7 @@ class Ops:
                 return False
             with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f in files:
-                    if f.is_file():
-                        zf.write(f, f.relative_to(tmp))
+                    if f.is_file(): zf.write(f, f.relative_to(tmp))
             mb = round(dest.stat().st_size / 1048576, 2)
             self.log(f"  OK - {name}.zip ({mb} MB)", "ok")
             return True
@@ -510,37 +482,28 @@ class Ops:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    # ---- backup orchestrator ----
-
     def backup_all(self, callback=None):
-        ts  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        bks = Path(self.cfg["backup_root"])
+        ts     = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        bks    = Path(self.cfg["backup_root"])
         bks.mkdir(parents=True, exist_ok=True)
         bk_set = bks / ts
         bk_set.mkdir()
         self.log(f"=== BACKUP -> {bk_set} ===", "bold")
         results = []
         for app in APPS:
-            if app.get("backup") is None:
-                continue  # Byparr: stateless, skip
+            if app.get("backup") is None: continue
             name   = app["name"]
             method = app["backup"]
-            self.log(f"")
+            self.log("")
             self.log(f"--- {name} ---", "bold")
             if method == "arr_api":
                 cfg_dir = self.resolve_path(app["config_paths"])
-                if cfg_dir:
-                    ok = self._arr_api_backup(app, cfg_dir, bk_set)
-                else:
-                    self.log(f"  Config dir not found for {name}.", "err")
-                    ok = False
+                ok = self._arr_api_backup(app, cfg_dir, bk_set) if cfg_dir else False
+                if not cfg_dir: self.log(f"  Config not found for {name}.", "err")
             elif method == "bazarr_api":
                 cfg_dir = self.resolve_path(app["config_paths"])
-                if cfg_dir:
-                    ok = self._bazarr_file_backup(app, cfg_dir, bk_set)
-                else:
-                    self.log(f"  Config dir not found for {name}.", "err")
-                    ok = False
+                ok = self._bazarr_file_backup(app, cfg_dir, bk_set) if cfg_dir else False
+                if not cfg_dir: self.log(f"  Config not found for {name}.", "err")
             elif method == "jellyfin_api":
                 cfg_dir = self.resolve_path(app["config_paths"])
                 if cfg_dir:
@@ -554,8 +517,7 @@ class Ops:
                     ok = False
             elif method == "file_copy":
                 if app.get("container"):
-                    vol_path = Path(self.cfg["base_root"]) / app["volume_subpath"]
-                    src = vol_path
+                    src = Path(self.cfg["base_root"]) / app["volume_subpath"]
                 else:
                     src = self.resolve_path(app["config_paths"])
                 if src and src.exists():
@@ -568,37 +530,30 @@ class Ops:
             else:
                 ok = False
             results.append((name, "OK" if ok else "FAILED"))
-        # Write manifest
         manifest = {
-            "timestamp": ts,
-            "machine": os.environ.get("COMPUTERNAME", "?"),
+            "timestamp": ts, "machine": os.environ.get("COMPUTERNAME", "?"),
             "results": [{"app": r[0], "status": r[1]} for r in results],
         }
         (bk_set / "manifest.json").write_text(json.dumps(manifest, indent=2))
         self.log("")
         self.log("=== Backup Summary ===", "bold")
         for name, status in results:
-            tag = "ok" if status == "OK" else "err"
-            self.log(f"  {name:<15} {status}", tag)
+            self.log(f"  {name:<15} {status}", "ok" if status == "OK" else "err")
         self.log(f"Saved to: {bk_set}", "ok")
-        if callback:
-            callback(results)
-
-    # ---- restore ----
+        if callback: callback(results)
 
     def list_backups(self):
         bks = Path(self.cfg["backup_root"])
-        if not bks.exists():
-            return []
+        if not bks.exists(): return []
         sets = []
         for d in sorted(bks.iterdir(), reverse=True):
             mf = d / "manifest.json"
             if d.is_dir() and mf.exists():
                 try:
-                    data = json.loads(mf.read_text())
+                    data  = json.loads(mf.read_text())
                     count = len(list(d.glob("*.zip")))
                     sets.append({"path": d, "timestamp": data["timestamp"],
-                                 "machine": data.get("machine","?"), "count": count})
+                                 "machine": data.get("machine", "?"), "count": count})
                 except Exception:
                     pass
         return sets
@@ -609,10 +564,8 @@ class Ops:
         results = []
         for app in APPS:
             name = app["name"]
-            if app_names and name not in app_names:
-                continue
-            if app.get("backup") is None:
-                continue
+            if app_names and name not in app_names: continue
+            if app.get("backup") is None: continue
             zip_path = bk_set / f"{name}.zip"
             if not zip_path.exists():
                 self.log(f"  No archive for {name} in this set.", "warn")
@@ -643,21 +596,25 @@ class Ops:
         self.log("")
         self.log("=== Restore Summary ===", "bold")
         for name, status in results:
-            self.log(f"  {name:<15} {status}", "ok" if status=="OK" else "err")
+            self.log(f"  {name:<15} {status}", "ok" if status == "OK" else "err")
 
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 class App:
     def __init__(self):
-        self.cfg = Config()
-        self.q   = queue.Queue()
-        self.ops = Ops(self.cfg, self._enqueue_log)
+        self.cfg  = Config()
+        self.q    = queue.Queue()
+        self.ops  = Ops(self.cfg, self._enqueue_log)
+        self._tw  = []   # list of callables for theme updates: fn(theme_dict)
+        self._status_labels = {}   # name -> tk.Label for status text
+        self._backup_sets   = []
+
+        self._theme_name = self.cfg.get("theme", "light")
 
         self.root = tk.Tk()
         self.root.title(f"Media Stack Manager v{VERSION}")
         self.root.geometry("1050x740")
-        self.root.configure(bg=C_BG)
         self.root.minsize(800, 600)
 
         self._setup_styles()
@@ -665,29 +622,76 @@ class App:
         self._build_notebook()
         self._build_log()
         self._build_statusbar()
+        self._apply_theme()   # paint initial theme
         self._check_queue()
 
         if not ctypes.windll.shell32.IsUserAnAdmin():
             self.log("WARNING: Not running as Administrator. Some operations may fail.", "warn")
 
+    # --- theme ---
+
+    def _t(self):
+        """Return current theme dict."""
+        return THEMES[self._theme_name]
+
     def _setup_styles(self):
+        t = self._t()
         s = ttk.Style()
         s.theme_use("clam")
-        s.configure(".", font=F_MAIN, background=C_BG)
-        s.configure("TNotebook", background=C_BG, borderwidth=0)
+        s.configure(".",             font=F_MAIN,  background=t["bg"],   foreground=t["fg"])
+        s.configure("TFrame",        background=t["bg"])
+        s.configure("Card.TFrame",   background=t["card"])
+        s.configure("TLabel",        background=t["bg"],   foreground=t["fg"])
+        s.configure("Card.TLabel",   background=t["card"], foreground=t["fg"])
+        s.configure("TNotebook",     background=t["bg"],   borderwidth=0)
         s.configure("TNotebook.Tab", font=F_BOLD, padding=[14, 6])
-        s.map("TNotebook.Tab", background=[("selected", C_ACCENT)],
+        s.map("TNotebook.Tab",
+              background=[("selected", C_ACCENT)],
               foreground=[("selected", "white")])
-        s.configure("TFrame", background=C_BG)
-        s.configure("Card.TFrame", background=C_CARD, relief="flat")
-        s.configure("TLabel", background=C_BG)
-        s.configure("Card.TLabel", background=C_CARD)
-        s.configure("Accent.TButton", font=F_BOLD, foreground="white",
+        s.configure("Accent.TButton", font=F_BOLD,  foreground="white",
                     background=C_ACCENT, borderwidth=0, padding=[10, 5])
         s.map("Accent.TButton", background=[("active", "#1976d2")])
-        s.configure("Small.TButton", font=F_MAIN, padding=[6, 3])
-        s.configure("TEntry", fieldbackground="white", padding=4)
-        s.configure("TScrollbar", background=C_BG)
+        s.configure("Small.TButton", font=F_MAIN,  padding=[6, 3],
+                    background=t["btn_bg"], foreground=t["btn_fg"])
+        s.configure("TEntry",        fieldbackground=t["entry_bg"], foreground=t["fg"], padding=4)
+        s.configure("TScrollbar",    background=t["bg"])
+
+    def _apply_theme(self):
+        t = self._t()
+        # Re-apply ttk styles
+        self._setup_styles()
+        # Update root bg
+        self.root.configure(bg=t["bg"])
+        # Run all stored widget update lambdas
+        for fn in self._tw:
+            try: fn(t)
+            except Exception: pass
+        # Specific named widgets
+        self.backup_list.configure(bg=t["listbox_bg"], fg=t["listbox_fg"],
+                                   selectbackground=C_ACCENT, selectforeground="white")
+        self._toggle_btn.configure(text=t["toggle_lbl"])
+
+    def _toggle_theme(self):
+        self._theme_name = "dark" if self._theme_name == "light" else "light"
+        self.cfg["theme"] = self._theme_name
+        self.cfg.save()
+        self._apply_theme()
+
+    def _tw_add(self, widget, **props):
+        """Register a tk widget for theme updates. props maps configure-key -> theme-key."""
+        self._tw.append(lambda t, w=widget, p=props: w.configure(**{k: t[v] for k, v in p.items()}))
+
+    # --- mouse-wheel scrolling ---
+
+    def _bind_scroll(self, region_widget, canvas):
+        """Enable mouse-wheel on canvas whenever cursor is inside region_widget."""
+        fn = lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        region_widget.bind("<Enter>", lambda e: self.root.bind_all("<MouseWheel>", fn))
+        region_widget.bind("<Leave>", lambda e: self.root.unbind_all("<MouseWheel>"))
+        canvas.bind(       "<Enter>", lambda e: self.root.bind_all("<MouseWheel>", fn))
+        canvas.bind(       "<Leave>", lambda e: self.root.unbind_all("<MouseWheel>"))
+
+    # --- header ---
 
     def _build_header(self):
         hdr = tk.Frame(self.root, bg=C_ACCENT, height=52)
@@ -697,15 +701,23 @@ class App:
                  bg=C_ACCENT, fg="white").pack(side="left", padx=8, pady=12)
         tk.Label(hdr, text=f"v{VERSION}", font=F_MAIN,
                  bg=C_ACCENT, fg="#90caf9").pack(side="left")
+        # Dark/Light toggle button (right side of header)
+        self._toggle_btn = tk.Button(
+            hdr, text=self._t()["toggle_lbl"],
+            font=F_MAIN, bg="#0d47a1", fg="white",
+            activebackground="#1565c0", activeforeground="white",
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            command=self._toggle_theme)
+        self._toggle_btn.pack(side="right", padx=12, pady=10)
 
     def _build_notebook(self):
         self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(8,0))
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 0))
         self._build_install_tab()
         self._build_backup_tab()
         self._build_settings_tab()
 
-    # ---- Install tab ----
+    # --- Install tab ---
 
     def _build_install_tab(self):
         outer = ttk.Frame(self.nb)
@@ -715,61 +727,89 @@ class App:
         top.pack(fill="x", padx=12, pady=8)
         ttk.Label(top, text="Base folder:").pack(side="left")
         self.base_var = tk.StringVar(value=self.cfg["base_root"])
-        ttk.Entry(top, textvariable=self.base_var, width=38).pack(side="left", padx=6)
+        ttk.Entry(top, textvariable=self.base_var, width=34).pack(side="left", padx=6)
         ttk.Button(top, text="Browse", style="Small.TButton",
                    command=self._browse_base).pack(side="left")
+        ttk.Button(top, text="Refresh Status", style="Small.TButton",
+                   command=self._refresh_status).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="Install All", style="Accent.TButton",
                    command=self._install_all).pack(side="right")
 
-        # Scrollable app list
-        canvas_frame = ttk.Frame(outer)
-        canvas_frame.pack(fill="both", expand=True, padx=12, pady=4)
-        canvas = tk.Canvas(canvas_frame, bg=C_BG, highlightthickness=0)
-        vsb = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+        cf = ttk.Frame(outer)
+        cf.pack(fill="both", expand=True, padx=12, pady=4)
+        canvas = tk.Canvas(cf, highlightthickness=0)
+        self._tw_add(canvas, bg="bg")
+        vsb = ttk.Scrollbar(cf, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         self.install_inner = ttk.Frame(canvas)
-        win = canvas.create_window((0,0), window=self.install_inner, anchor="nw")
-        def on_configure(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(win, width=canvas.winfo_width())
-        self.install_inner.bind("<Configure>", on_configure)
+        win = canvas.create_window((0, 0), window=self.install_inner, anchor="nw")
+        self.install_inner.bind(
+            "<Configure>",
+            lambda e: (canvas.configure(scrollregion=canvas.bbox("all")),
+                       canvas.itemconfig(win, width=canvas.winfo_width())))
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=canvas.winfo_width()))
+        self._bind_scroll(cf, canvas)
         self.status_vars = {}
         for app in APPS:
             self._add_app_row(self.install_inner, app)
 
     def _add_app_row(self, parent, app):
         name = app["name"]
-        row  = tk.Frame(parent, bg=C_CARD, pady=2)
+        t    = self._t()
+        row  = tk.Frame(parent, pady=2)
+        self._tw_add(row, bg="card")
         row.pack(fill="x", padx=2, pady=3)
         row.columnconfigure(2, weight=1)
-        # Color bar
+        # Left color bar (app-specific color, not themed)
         clr = {"Jellyfin":"#00a4dc","Sonarr":"#35c5f4","Radarr":"#ffc230",
                "Prowlarr":"#ff6a00","Bazarr":"#9b59b6","qBittorrent":"#2ecc71",
                "Byparr":"#e74c3c","Seer":"#1abc9c"}.get(name, C_ACCENT)
         tk.Frame(row, bg=clr, width=6).grid(row=0, column=0, rowspan=2, sticky="ns")
-        tk.Label(row, text=name, font=F_BOLD, bg=C_CARD, anchor="w",
-                 width=14).grid(row=0, column=1, sticky="w", padx=(8,4), pady=(6,0))
-        tk.Label(row, text=app["desc"], font=F_MAIN, bg=C_CARD, fg="#555",
-                 anchor="w").grid(row=1, column=1, sticky="w", padx=(8,4), pady=(0,6))
-        # Method badge
-        method_colors = {"winget":"#1565c0","docker":"#0288d1","browser":"#6a1b9a"}
-        method = app.get("install","?")
-        mc = method_colors.get(method, "#555")
-        badge = tk.Label(row, text=method.upper(), bg=mc, fg="white",
-                         font=("Segoe UI", 8, "bold"), padx=5, pady=1)
-        badge.grid(row=0, column=2, sticky="w", padx=4, pady=(6,0))
-        # Status indicator
-        sv = tk.StringVar(value="?")
+        # App name
+        lbl_name = tk.Label(row, text=name, font=F_BOLD, anchor="w", width=14)
+        self._tw_add(lbl_name, bg="card", fg="fg")
+        lbl_name.grid(row=0, column=1, sticky="w", padx=(8, 4), pady=(6, 0))
+        # App description
+        lbl_desc = tk.Label(row, text=app["desc"], font=F_MAIN, anchor="w")
+        self._tw_add(lbl_desc, bg="card", fg="fg_dim")
+        lbl_desc.grid(row=1, column=1, sticky="w", padx=(8, 4), pady=(0, 6))
+        # Install method badge (keeps own color)
+        method_colors = {"winget": "#1565c0", "docker": "#0288d1", "browser": "#6a1b9a"}
+        method = app.get("install", "")
+        mc     = method_colors.get(method, "#555")
+        badge  = tk.Label(row, text=method.upper(), bg=mc, fg="white",
+                          font=("Segoe UI", 8, "bold"), padx=5, pady=1)
+        badge.grid(row=0, column=2, sticky="w", padx=4, pady=(6, 0))
+        # Status label (starts blank; updated by Refresh Status)
+        sv = tk.StringVar(value="")
         self.status_vars[name] = sv
-        tk.Label(row, textvariable=sv, bg=C_CARD, fg="#888",
-                 font=F_MAIN).grid(row=1, column=2, sticky="w", padx=4, pady=(0,6))
+        status_lbl = tk.Label(row, textvariable=sv, font=F_MAIN, anchor="w")
+        self._tw_add(status_lbl, bg="card")
+        status_lbl.grid(row=1, column=2, sticky="w", padx=4, pady=(0, 6))
+        self._status_labels[name] = status_lbl
         # Install button
-        btn = ttk.Button(row, text="Install", style="Small.TButton",
-                         command=lambda a=app: self._install_one(a))
-        btn.grid(row=0, column=3, rowspan=2, padx=8, pady=6)
+        ttk.Button(row, text="Install", style="Small.TButton",
+                   command=lambda a=app: self._install_one(a)
+                   ).grid(row=0, column=3, rowspan=2, padx=8, pady=6)
+
+    def _refresh_status(self):
+        def run():
+            for app in APPS:
+                name, color_key = app["name"], None
+                label, color_key = self.ops.check_app_status(app)
+                self.root.after(0, lambda n=name, lb=label, ck=color_key:
+                               self._set_status(n, lb, ck))
+        self._run_bg(run)
+
+    def _set_status(self, name, label, color_key):
+        t = self._t()
+        if name in self.status_vars:
+            self.status_vars[name].set(label)
+        if name in self._status_labels:
+            color = t.get(color_key, t["fg_dim"])
+            self._status_labels[name].configure(fg=color)
 
     def _browse_base(self):
         d = filedialog.askdirectory(initialdir=self.base_var.get())
@@ -784,12 +824,9 @@ class App:
     def _install_all(self):
         self.cfg["base_root"] = self.base_var.get()
         self.cfg.save()
-        def run():
-            for app in APPS:
-                self.ops.install_app(app)
-        self._run_bg(run)
+        self._run_bg(lambda: [self.ops.install_app(a) for a in APPS])
 
-    # ---- Backup / Restore tab ----
+    # --- Backup / Restore tab ---
 
     def _build_backup_tab(self):
         outer = ttk.Frame(self.nb)
@@ -798,40 +835,61 @@ class App:
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(0, weight=1)
 
-        # Left: Backup
-        lf = tk.LabelFrame(outer, text=" Backup ", font=F_BOLD, bg=C_BG, padx=10, pady=10)
-        lf.grid(row=0, column=0, sticky="nsew", padx=(12,6), pady=12)
+        # Left: Backup panel
+        lf = tk.LabelFrame(outer, text=" Backup ", font=F_BOLD, padx=10, pady=10)
+        self._tw_add(lf, bg="lf_bg", fg="lf_fg")
+        lf.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
         lf.columnconfigure(0, weight=1)
-        ttk.Label(lf, text="Creates a timestamped snapshot of every app\n"
-                            "using each app's built-in backup where available.").pack(anchor="w")
+
+        desc = tk.Label(lf, text="Creates a timestamped snapshot of every app\n"
+                            "using each app's built-in backup where available.",
+                        font=F_MAIN, justify="left", anchor="w")
+        self._tw_add(desc, bg="lf_bg", fg="fg")
+        desc.pack(anchor="w")
+
         ttk.Button(lf, text="Back Up All Now", style="Accent.TButton",
-                   command=self._do_backup).pack(anchor="w", pady=(12,4))
-        ttk.Label(lf, text="Individual apps:").pack(anchor="w", pady=(10,2))
+                   command=self._do_backup).pack(anchor="w", pady=(12, 4))
+
+        sep_lbl = tk.Label(lf, text="Individual apps:", font=F_MAIN, anchor="w")
+        self._tw_add(sep_lbl, bg="lf_bg", fg="fg_dim")
+        sep_lbl.pack(anchor="w", pady=(10, 2))
+
         for app in APPS:
-            if app.get("backup") is None:
-                continue
+            if app.get("backup") is None: continue
             ttk.Button(lf, text=f"  Back up {app['name']}",
                        style="Small.TButton",
                        command=lambda a=app: self._backup_one(a)).pack(anchor="w", pady=1)
 
-        # Right: Restore
-        rf = tk.LabelFrame(outer, text=" Restore ", font=F_BOLD, bg=C_BG, padx=10, pady=10)
-        rf.grid(row=0, column=1, sticky="nsew", padx=(6,12), pady=12)
+        # Right: Restore panel
+        rf = tk.LabelFrame(outer, text=" Restore ", font=F_BOLD, padx=10, pady=10)
+        self._tw_add(rf, bg="lf_bg", fg="lf_fg")
+        rf.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
         rf.columnconfigure(0, weight=1)
         rf.rowconfigure(1, weight=1)
-        ttk.Label(rf, text="Select a backup set to restore from:").grid(row=0, column=0, sticky="w")
+
+        hdr_lbl = tk.Label(rf, text="Select a backup set:", font=F_MAIN, anchor="w")
+        self._tw_add(hdr_lbl, bg="lf_bg", fg="fg")
+        hdr_lbl.grid(row=0, column=0, sticky="w")
+
         self.backup_list = tk.Listbox(rf, font=F_MONO, height=12,
-                                       selectmode="single", bg="white")
+                                      selectmode="single",
+                                      bg="white", fg="#111",
+                                      selectbackground=C_ACCENT, selectforeground="white")
         self.backup_list.grid(row=1, column=0, sticky="nsew", pady=6)
         sb = ttk.Scrollbar(rf, command=self.backup_list.yview)
         sb.grid(row=1, column=1, sticky="ns", pady=6)
         self.backup_list.configure(yscrollcommand=sb.set)
+        self.backup_list.bind("<MouseWheel>",
+            lambda e: self.backup_list.yview_scroll(int(-1*(e.delta/120)), "units"))
+
         btn_row = ttk.Frame(rf)
-        btn_row.grid(row=2, column=0, columnspan=2, sticky="ew")
-        ttk.Button(btn_row, text="Refresh List", style="Small.TButton",
-                   command=self._refresh_backup_list).pack(side="left", padx=(0,6))
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(btn_row, text="Refresh", style="Small.TButton",
+                   command=self._refresh_backup_list).pack(side="left", padx=(0, 4))
         ttk.Button(btn_row, text="Restore Selected", style="Accent.TButton",
-                   command=self._do_restore).pack(side="left")
+                   command=self._do_restore).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_row, text="Delete Selected", style="Small.TButton",
+                   command=self._delete_backup).pack(side="left")
         self._refresh_backup_list()
 
     def _refresh_backup_list(self):
@@ -852,20 +910,16 @@ class App:
         bk_set.mkdir(parents=True, exist_ok=True)
         def run():
             method = app.get("backup")
-            if method == "arr_api":
-                cfg_dir = self.ops.resolve_path(app["config_paths"])
-                if cfg_dir: self.ops._arr_api_backup(app, cfg_dir, bk_set)
-            elif method == "bazarr_api":
-                cfg_dir = self.ops.resolve_path(app["config_paths"])
-                if cfg_dir: self.ops._bazarr_file_backup(app, cfg_dir, bk_set)
-            elif method == "jellyfin_api":
-                cfg_dir = self.ops.resolve_path(app["config_paths"])
-                if cfg_dir: self.ops._jellyfin_api_backup(app, cfg_dir, bk_set)
+            cfg_dir = self.ops.resolve_path(app.get("config_paths", []))
+            if method == "arr_api" and cfg_dir:
+                self.ops._arr_api_backup(app, cfg_dir, bk_set)
+            elif method == "bazarr_api" and cfg_dir:
+                self.ops._bazarr_file_backup(app, cfg_dir, bk_set)
+            elif method == "jellyfin_api" and cfg_dir:
+                self.ops._jellyfin_api_backup(app, cfg_dir, bk_set)
             elif method == "file_copy":
-                if app.get("container"):
-                    src = Path(self.cfg["base_root"]) / app["volume_subpath"]
-                else:
-                    src = self.ops.resolve_path(app["config_paths"])
+                src = Path(self.cfg["base_root"]) / app["volume_subpath"] \
+                      if app.get("container") else cfg_dir
                 if src and src.exists():
                     self.ops.stop_app(app)
                     self.ops._file_copy_backup(app, src, bk_set)
@@ -885,40 +939,62 @@ class App:
             return
         self._run_bg(lambda: self.ops.restore_backup(bk["path"]))
 
-    # ---- Settings tab ----
+    def _delete_backup(self):
+        sel = self.backup_list.curselection()
+        if not sel:
+            messagebox.showwarning("Delete", "Select a backup set to delete.")
+            return
+        bk = self._backup_sets[sel[0]]
+        if not messagebox.askyesno("Confirm Delete",
+                f"Permanently delete backup:\n{bk['timestamp']}\n\n"
+                "This cannot be undone."):
+            return
+        try:
+            shutil.rmtree(bk["path"])
+            self.log(f"Deleted backup: {bk['timestamp']}", "warn")
+        except Exception as e:
+            self.log(f"Delete failed: {e}", "err")
+        self._refresh_backup_list()
+
+    # --- Settings tab ---
 
     def _build_settings_tab(self):
-        outer = ttk.Frame(self.nb)
+        outer  = ttk.Frame(self.nb)
         self.nb.add(outer, text="  Settings  ")
-        canvas = tk.Canvas(outer, bg=C_BG, highlightthickness=0)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        self._tw_add(canvas, bg="bg")
         vsb    = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         inner = ttk.Frame(canvas)
-        win   = canvas.create_window((0,0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win   = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=canvas.winfo_width()))
+        self._bind_scroll(outer, canvas)
         self._setting_vars = {}
 
+        row_idx = [0]
+
         def section(text):
-            ttk.Label(inner, text=text, font=F_BOLD,
-                      foreground=C_ACCENT).grid(row=section.row, column=0, columnspan=3,
-                                                 sticky="w", padx=14, pady=(14,2))
-            section.row += 1
-        section.row = 0
+            lbl = ttk.Label(inner, text=text, font=F_BOLD)
+            lbl.grid(row=row_idx[0], column=0, columnspan=3, sticky="w", padx=14, pady=(14, 2))
+            # Force section label to use section_fg color via _tw
+            self._tw.append(lambda t, w=lbl: w.configure(foreground=t["section_fg"]))
+            row_idx[0] += 1
 
         def field(label, key, is_dir=False):
-            r = section.row
-            ttk.Label(inner, text=label).grid(row=r, column=0, sticky="w", padx=(14,4), pady=3)
+            r = row_idx[0]
+            ttk.Label(inner, text=label).grid(row=r, column=0, sticky="w", padx=(14, 4), pady=3)
             var = tk.StringVar(value=self.cfg[key])
             self._setting_vars[key] = var
             ttk.Entry(inner, textvariable=var, width=44).grid(row=r, column=1, sticky="ew", padx=4)
             if is_dir:
                 ttk.Button(inner, text="...", width=3, style="Small.TButton",
                            command=lambda v=var: v.set(filedialog.askdirectory() or v.get())
-                           ).grid(row=r, column=2, padx=(0,14))
-            section.row += 1
+                           ).grid(row=r, column=2, padx=(0, 14))
+            row_idx[0] += 1
 
         section("Folders")
         field("Base folder",      "base_root",      is_dir=True)
@@ -937,19 +1013,20 @@ class App:
         field("Seer port",        "seer_port")
 
         section("Docker Images")
-        field("Byparr image",     "byparr_image")
-        field("Seer image",       "seer_image")
+        field("Byparr image", "byparr_image")
+        field("Seer image",   "seer_image")
 
         section("API Keys")
         field("Jellyfin API key", "jellyfin_api_key")
-        ttk.Label(inner, text="Create in Jellyfin Dashboard -> Advanced -> API Keys",
-                  foreground="#888").grid(row=section.row, column=1, sticky="w", pady=(0,6))
-        section.row += 1
+        hint = ttk.Label(inner, text="Create in Jellyfin Dashboard -> Advanced -> API Keys")
+        self._tw.append(lambda t, w=hint: w.configure(foreground=t["fg_dim"]))
+        hint.grid(row=row_idx[0], column=1, sticky="w", pady=(0, 6))
+        row_idx[0] += 1
 
         inner.columnconfigure(1, weight=1)
         ttk.Button(inner, text="Save Settings", style="Accent.TButton",
                    command=self._save_settings).grid(
-                   row=section.row, column=0, columnspan=3, pady=14, padx=14, sticky="w")
+            row=row_idx[0], column=0, columnspan=3, pady=14, padx=14, sticky="w")
 
     def _save_settings(self):
         for key, var in self._setting_vars.items():
@@ -958,11 +1035,11 @@ class App:
         self.base_var.set(self.cfg["base_root"])
         self.log("Settings saved.", "ok")
 
-    # ---- Log area ----
+    # --- Log ---
 
     def _build_log(self):
         frame = ttk.Frame(self.root)
-        frame.pack(fill="x", padx=10, pady=(4,0))
+        frame.pack(fill="x", padx=10, pady=(4, 0))
         hdr = tk.Frame(frame, bg=C_LOG_BG)
         hdr.pack(fill="x")
         tk.Label(hdr, text=" Output Log", bg=C_LOG_BG, fg="#888",
@@ -989,7 +1066,7 @@ class App:
         tk.Label(bar, textvariable=self.status_var, bg=C_ACCENT, fg="white",
                  font=F_MONO, anchor="w").pack(side="left", padx=8)
 
-    # ---- Threading / queue ----
+    # --- Queue / threading ---
 
     def log(self, msg, tag="info"):
         self._enqueue_log(msg, tag)
@@ -1016,8 +1093,7 @@ class App:
         self.log_txt.configure(state="disabled")
 
     def _run_bg(self, fn):
-        t = threading.Thread(target=fn, daemon=True)
-        t.start()
+        threading.Thread(target=fn, daemon=True).start()
 
     def run(self):
         self.root.mainloop()
@@ -1026,7 +1102,6 @@ class App:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Request elevation on Windows if needed
     if sys.platform == "win32" and not ctypes.windll.shell32.IsUserAnAdmin():
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, " ".join(f'"{a}"' for a in sys.argv), None, 1)
