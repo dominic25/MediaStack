@@ -357,16 +357,16 @@ class App:
         ck_fr.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
         self._checklist_vars = {}
         ck_items = [
-            ("checklist_folders_saved", "Saved valid folder paths in Settings"),
-            ("checklist_deps_reviewed", "Reviewed system dependencies (above)"),
-            ("checklist_apps_installed", "Installed apps from the Install tab"),
-            ("checklist_auto_configure_done", "Ran Auto-Configure successfully"),
-            ("checklist_jellyfin_api", "Set Jellyfin API key (for library setup)"),
+            ("checklist_folders_saved", "Saved valid folder paths in Settings", 3),
+            ("checklist_deps_reviewed", "Reviewed system dependencies (above)", None),
+            ("checklist_apps_installed", "Installed apps from the Install tab", 1),
+            ("checklist_auto_configure_done", "Ran Auto-Configure successfully", 1),
+            ("checklist_jellyfin_api", "Set Jellyfin API key (for library setup)", 3),
         ]
         ck_inner = tk.Frame(ck_fr)
         self._tw_add(ck_inner, bg="lf_bg")
         ck_inner.pack(fill="x")
-        for key, ctext in ck_items:
+        for key, ctext, tab_idx in ck_items:
             var = tk.BooleanVar(value=bool(self.cfg.get(key)))
             self._checklist_vars[key] = var
 
@@ -376,9 +376,19 @@ class App:
                     self.cfg.save()
                 return _t
 
+            row_f = tk.Frame(ck_inner)
+            self._tw_add(row_f, bg="lf_bg")
+            row_f.pack(fill="x", pady=1)
+
             cb = ttk.Checkbutton(
-                ck_inner, text=ctext, variable=var, command=_mk_toggle(key))
-            cb.pack(anchor="w", pady=1)
+                row_f, text=ctext, variable=var, command=_mk_toggle(key))
+            cb.pack(side="left", anchor="w")
+            
+            if tab_idx is not None:
+                lbl_go = tk.Label(row_f, text="[Go \u2192]", font=F_MAIN, cursor="hand2", fg=C_ACCENT)
+                self._tw_add(lbl_go, bg="lf_bg")
+                lbl_go.bind("<Button-1>", lambda e, idx=tab_idx: self.nb.select(idx))
+                lbl_go.pack(side="left", padx=8)
         _Tooltip(
             ck_fr,
             "Check items as you complete them. Stored in your config file.",
@@ -426,8 +436,17 @@ class App:
             ml = tk.Label(card, textvariable=mv, font=F_MONO, anchor="w")
             self._tw_add(ml, bg="card", fg="fg_dim")
             ml.pack(anchor="w")
+            
+            btn_frame = tk.Frame(card)
+            self._tw_add(btn_frame, bg="card")
+            btn_frame.pack(fill="x", pady=(4, 0))
+            
+            btn_web = ttk.Button(btn_frame, text="🌐 Web UI", style="Small.TButton",
+                                 command=lambda a=app: self._open_app_web_ui(a))
+            btn_web.pack(side="right")
+            
             tip = "Double-click to open web UI when the app is running."
-            for w in (card, nl, pl, sl, ml):
+            for w in (card, nl, pl, sl, ml, btn_frame):
                 w.bind("<Double-1>", lambda e, a=app: self._open_app_web_ui(a))
             _Tooltip(card, tip, self)
 
@@ -529,61 +548,135 @@ class App:
 
     def _show_onboarding(self):
         win = tk.Toplevel(self.root)
-        win.title("Getting started")
+        win.title("Getting started wizard")
         win.transient(self.root)
         win.grab_set()
-        win.minsize(420, 380)
+        win.minsize(500, 420)
         th = self._t()
         win.configure(bg=th["bg"])
-        frm = ttk.Frame(win, padding=14)
-        frm.pack(fill="both", expand=True)
+        
+        container = ttk.Frame(win, padding=14)
+        container.pack(fill="both", expand=True)
+        
+        pages = []
+        
+        # --- Page 1: Welcome & Checks ---
+        p1 = tk.Frame(container, bg=th["bg"])
+        tk.Label(p1, text="Welcome to Media Stack Manager", font=F_TITLE, bg=th["bg"], fg=th["fg"]).pack(pady=(0, 12))
+        tk.Label(p1, text="Before we begin, let's check your system dependencies.", 
+                 font=F_MAIN, bg=th["bg"], fg=th["fg"]).pack(anchor="w", pady=(0, 12))
+        
+        env_frame = tk.Frame(p1, bg=th["lf_bg"], padx=10, pady=10)
+        env_frame.pack(fill="x", pady=8)
+        env_labels = {}
+        for key, title in [("winget", "winget (installs):"), ("docker_cli", "Docker CLI:"), ("docker_daemon", "Docker running:"), ("admin", "Administrator:")]:
+            row = tk.Frame(env_frame, bg=th["lf_bg"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=title, font=F_MAIN, bg=th["lf_bg"], fg=th["fg_dim"], width=20, anchor="w").pack(side="left")
+            sv = tk.StringVar(value="Checking...")
+            env_labels[key] = sv
+            tk.Label(row, textvariable=sv, font=F_BOLD, bg=th["lf_bg"], fg=th["fg"]).pack(side="left")
+            
+        def _check_env():
+            env = check_environment()
+            env_labels["winget"].set("OK" if env["winget"] else "Missing")
+            env_labels["docker_cli"].set("OK" if env["docker_cli"] else "Missing")
+            env_labels["docker_daemon"].set("OK" if env["docker_daemon"] else "Not running")
+            env_labels["admin"].set("Yes" if env["admin"] else "No")
+        self.root.after(100, _check_env)
+        pages.append(p1)
+        
+        # --- Page 2: Folders ---
+        p2 = tk.Frame(container, bg=th["bg"])
+        tk.Label(p2, text="Essential Folders Setup", font=F_TITLE, bg=th["bg"], fg=th["fg"]).pack(pady=(0, 12))
+        tk.Label(p2, text="Where should your data be stored? (Paths must exist).", 
+                 font=F_MAIN, bg=th["bg"], fg=th["fg"]).pack(anchor="w", pady=(0, 12))
+                 
+        f_frame = tk.Frame(p2, bg=th["bg"])
+        f_frame.pack(fill="x", pady=8)
+        
+        def _field(parent, label, key):
+            row = tk.Frame(parent, bg=th["bg"])
+            row.pack(fill="x", pady=4)
+            tk.Label(row, text=label, font=F_MAIN, bg=th["bg"], fg=th["fg"], width=16, anchor="w").pack(side="left")
+            var = tk.StringVar(value=self.cfg.get(key, ""))
+            e = ttk.Entry(row, textvariable=var, width=32)
+            e.pack(side="left", padx=4)
+            ttk.Button(row, text="...", width=3, style="Small.TButton",
+                       command=lambda v=var: v.set(filedialog.askdirectory() or v.get())).pack(side="left")
+            return var
+            
+        v_base = _field(f_frame, "Base folder:", "base_root")
+        v_media = _field(f_frame, "Media folder:", "media_root")
+        v_down = _field(f_frame, "Downloads folder:", "downloads_root")
+        v_back = _field(f_frame, "Backup folder:", "backup_root")
+        pages.append(p2)
+        
+        # --- Page 3: Summary ---
+        p3 = tk.Frame(container, bg=th["bg"])
+        tk.Label(p3, text="You're Ready!", font=F_TITLE, bg=th["bg"], fg=th["fg"]).pack(pady=(0, 12))
         body = (
-            "Welcome to Media Stack Manager.\n\n"
-            "1. Open Settings and set Base, Media, Downloads, and Backup folders.\n"
-            "   Paths must already exist on disk before you can save.\n\n"
-            "2. Use the Dashboard tab to verify winget, Docker, and free disk space.\n\n"
-            "3. Install apps from the Install tab, start them, then run Auto-Configure.\n\n"
-            "4. Add a Jellyfin API key in Settings if you want libraries created automatically.\n\n"
+            "1. Install apps from the Install tab, start them, then run Auto-Configure.\n\n"
+            "2. Add a Jellyfin API key in Settings if you want libraries created automatically.\n\n"
             "See the Help tab for FAQ and documentation links."
         )
-        t = tk.Text(
-            frm, wrap="word", font=F_MAIN, height=16, width=54, state="disabled",
-            bg=th["entry_bg"], fg=th["fg"], insertbackground=th["fg"],
-            selectbackground=th["card"], selectforeground=th["fg"],
-            relief="flat", borderwidth=0, highlightthickness=0)
-        t.pack(fill="both", expand=True, pady=(0, 12))
-        t.configure(state="normal")
-        t.insert("1.0", body)
-        t.configure(state="disabled")
-
-        self._onboarding_win = win
-        self._onboarding_txt = t
-
-        def _onboarding_closed(event):
-            if event.widget is win:
-                self._onboarding_win = None
-                self._onboarding_txt = None
-
-        win.bind("<Destroy>", _onboarding_closed)
-        dont = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm, text="Do not show this wizard again", variable=dont
-        ).pack(anchor="w")
-        bf = ttk.Frame(frm)
-        bf.pack(fill="x", pady=(8, 0))
-
-        def finish():
+        t = tk.Label(p3, text=body, font=F_MAIN, bg=th["bg"], fg=th["fg"], justify="left")
+        t.pack(anchor="w", pady=(0, 24))
+        
+        dont = tk.BooleanVar(value=True)
+        ttk.Checkbutton(p3, text="Do not show this wizard again", variable=dont).pack(anchor="w")
+        pages.append(p3)
+        
+        curr_page = [0]
+        
+        def _show_page(idx):
+            for p in pages: p.pack_forget()
+            pages[idx].pack(fill="both", expand=True)
+            b_prev.pack_forget()
+            b_next.pack_forget()
+            b_finish.pack_forget()
+            if idx > 0:
+                b_prev.pack(side="left")
+            if idx < len(pages) - 1:
+                b_next.pack(side="right")
+            else:
+                b_finish.pack(side="right")
+        
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=14, pady=14)
+        
+        def _next():
+            if curr_page[0] == 1:
+                self.cfg["base_root"] = v_base.get()
+                self.cfg["media_root"] = v_media.get()
+                self.cfg["downloads_root"] = v_down.get()
+                self.cfg["backup_root"] = v_back.get()
+                errs = self.cfg.validate()
+                if errs:
+                    messagebox.showwarning("Validation failed", "\n".join(errs), parent=win)
+                    return
+                self.cfg.save()
+                self._reload_settings_from_cfg()
+            if curr_page[0] < len(pages) - 1:
+                curr_page[0] += 1
+                _show_page(curr_page[0])
+                
+        def _prev():
+            if curr_page[0] > 0:
+                curr_page[0] -= 1
+                _show_page(curr_page[0])
+                
+        def _finish():
             if dont.get():
                 self.cfg["onboarding_complete"] = True
                 self.cfg.save()
             win.destroy()
-
-        ttk.Button(bf, text="Get started", style="Accent.TButton", command=finish).pack(side="right")
-
-        def _close_onboarding():
-            win.destroy()
-
-        win.protocol("WM_DELETE_WINDOW", _close_onboarding)
+            
+        b_prev = ttk.Button(bf, text="< Back", style="Small.TButton", command=_prev)
+        b_next = ttk.Button(bf, text="Next >", style="Accent.TButton", command=_next)
+        b_finish = ttk.Button(bf, text="Get started", style="Accent.TButton", command=_finish)
+        
+        _show_page(0)
 
     # --- Install tab ---
 
@@ -1217,8 +1310,15 @@ class App:
         frame.pack(fill="x", padx=10, pady=(4, 0))
         hdr = tk.Frame(frame, bg=C_LOG_BG)
         hdr.pack(fill="x")
-        tk.Label(hdr, text=" Output Log", bg=C_LOG_BG, fg="#888",
-                 font=F_MONO).pack(side="left", padx=6, pady=2)
+        
+        self._log_collapsed = True
+        
+        self._log_toggle_btn = tk.Button(
+            hdr, text="[\u25B2] Output Log", bg=C_LOG_BG, fg="#888",
+            font=F_MONO, bd=0, cursor="hand2", command=self._toggle_log
+        )
+        self._log_toggle_btn.pack(side="left", padx=6, pady=2)
+        
         tk.Button(hdr, text="Clear", bg=C_LOG_BG, fg="#888", font=F_MONO,
                   bd=0, cursor="hand2",
                   command=self._clear_log).pack(side="right", padx=6)
@@ -1226,12 +1326,23 @@ class App:
             frame, height=10, bg=C_LOG_BG, fg=C_LOG_FG, font=F_MONO,
             insertbackground=C_LOG_FG, wrap="word", state="disabled",
             relief="flat", borderwidth=0)
-        self.log_txt.pack(fill="x")
+        
+        # log_txt is NOT packed initially, so it's collapsed by default
+        
         self.log_txt.tag_configure("ok",   foreground=C_LOG_OK)
         self.log_txt.tag_configure("warn", foreground=C_LOG_WRN)
         self.log_txt.tag_configure("err",  foreground=C_LOG_ERR)
         self.log_txt.tag_configure("bold", foreground="#ffffff", font=("Consolas", 9, "bold"))
         self.log_txt.tag_configure("info", foreground=C_LOG_FG)
+
+    def _toggle_log(self):
+        self._log_collapsed = not self._log_collapsed
+        if self._log_collapsed:
+            self._log_toggle_btn.configure(text="[\u25B2] Output Log")
+            self.log_txt.pack_forget()
+        else:
+            self._log_toggle_btn.configure(text="[\u25BC] Output Log")
+            self.log_txt.pack(fill="x")
 
     def _build_statusbar(self):
         self.status_var = tk.StringVar(value="Ready")
